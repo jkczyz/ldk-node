@@ -12,6 +12,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use bdk_chain::spk_client::{FullScanRequest, SyncRequest};
+use bdk_wallet::descriptor::ExtendedDescriptor;
 #[allow(deprecated)]
 use bdk_wallet::SignOptions;
 use bdk_wallet::{Balance, KeychainKind, PersistedWallet, Update};
@@ -565,6 +566,15 @@ impl Wallet {
 		&self, must_spend: Vec<Input>, must_pay_to: &[TxOut], fee_rate: FeeRate,
 	) -> Result<Vec<FundingTxInput>, ()> {
 		let mut locked_wallet = self.inner.lock().unwrap();
+		debug_assert!(matches!(
+			locked_wallet.public_descriptor(KeychainKind::External),
+			ExtendedDescriptor::Wpkh(_)
+		));
+		debug_assert!(matches!(
+			locked_wallet.public_descriptor(KeychainKind::Internal),
+			ExtendedDescriptor::Wpkh(_)
+		));
+
 		let mut tx_builder = locked_wallet.build_tx();
 		tx_builder.only_witness_utxo();
 
