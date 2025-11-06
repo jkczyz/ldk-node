@@ -1233,6 +1233,11 @@ impl Node {
 	/// This provides for increasing a channel's outbound liquidity without re-balancing or closing
 	/// it. Once negotiation with the counterparty is complete, the channel remains operational
 	/// while waiting for a new funding transaction to confirm.
+	///
+	/// # Experimental API
+	///
+	/// This API is experimental. Currently, a splice-in will be marked as an outbound payment, but
+	/// this classification may change in the future.
 	pub fn splice_in(
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
 		splice_amount_sats: u64,
