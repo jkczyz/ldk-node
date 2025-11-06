@@ -1333,6 +1333,12 @@ impl Node {
 	/// This provides for decreasing a channel's outbound liquidity without re-balancing or closing
 	/// it. Once negotiation with the counterparty is complete, the channel remains operational
 	/// while waiting for a new funding transaction to confirm.
+	///
+	/// # Experimental API
+	///
+	/// This API is experimental. Currently, a splice-out will be marked as an inbound payment if
+	/// paid to an address associated with the on-chain wallet, but this classification may change
+	/// in the future.
 	pub fn splice_out(
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey, address: Address,
 		splice_amount_sats: u64,
