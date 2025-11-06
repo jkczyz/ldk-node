@@ -1340,7 +1340,7 @@ impl Node {
 	/// paid to an address associated with the on-chain wallet, but this classification may change
 	/// in the future.
 	pub fn splice_out(
-		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey, address: Address,
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey, address: &Address,
 		splice_amount_sats: u64,
 	) -> Result<(), Error> {
 		let open_channels =
@@ -1352,7 +1352,7 @@ impl Node {
 				return Err(Error::ChannelSplicingFailed);
 			}
 
-			self.wallet.parse_and_validate_address(&address)?;
+			self.wallet.parse_and_validate_address(address)?;
 
 			let contribution = SpliceContribution::SpliceOut {
 				outputs: vec![bitcoin::TxOut {
