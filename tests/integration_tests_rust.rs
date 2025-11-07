@@ -1034,6 +1034,9 @@ async fn splice_channel() {
 	expect_payment_successful_event!(node_b, Some(payment_id), None);
 	expect_payment_received_event!(node_a, amount_msat);
 
+	// Mine a block to give time for the HTLC to resolve
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+
 	assert_eq!(
 		node_a.list_balances().total_lightning_balance_sats,
 		4_000_000 - closing_transaction_fee_sat - anchor_output_sat + amount_msat / 1000
