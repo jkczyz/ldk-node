@@ -1103,6 +1103,9 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		1
 	);
 
+	// Mine a block to give time for the HTLC to resolve
+	generate_blocks_and_wait(&bitcoind, electrsd, 1).await;
+
 	println!("\nB splices out to pay A");
 	let addr_a = node_a.onchain_payment().new_address().unwrap();
 	let splice_out_sat = funding_amount_sat / 2;
