@@ -2366,6 +2366,7 @@ fn build_with_store_internal(
 		scorer,
 		peer_store,
 		payment_store,
+		pending_payment_store,
 		lnurl_auth,
 		is_running,
 		node_metrics,
