@@ -24,13 +24,14 @@ use common::{
 	generate_listening_addresses, invalidate_blocks, open_channel, open_channel_push_amt,
 	open_channel_with_all, premine_and_distribute_funds, premine_blocks, prepare_rbf,
 	random_chain_source, random_config, setup_bitcoind_and_electrsd, setup_builder, setup_node,
-	setup_two_nodes, splice_in_with_all, wait_for_block, wait_for_tx, TestChainSource, TestConfig,
-	TestStoreType, TestSyncStore,
+	setup_two_nodes, splice_in_with_all, wait_for_block, wait_for_tx, ExpectOnchainPaymentEvent,
+	OnchainPaymentEvent, TestChainSource, TestConfig, TestStoreType, TestSyncStore,
 };
 use electrsd::corepc_node::{self, Node as BitcoinD};
 use electrsd::ElectrsD;
 use ldk_node::config::{AsyncPaymentsRole, EsploraSyncConfig, DEFAULT_FULL_SCAN_STOP_GAP};
 use ldk_node::entropy::NodeEntropy;
+use ldk_node::lightning::chain::channelmonitor::ANTI_REORG_DELAY;
 use ldk_node::liquidity::LSPS2ServiceConfig;
 use ldk_node::payment::{
 	ConfirmationStatus, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
@@ -140,7 +141,7 @@ async fn peer_removed_when_counterparty_force_closes_last_channel() {
 
 	let address_a = node_a.onchain_payment().new_address().unwrap();
 	let premine_amount_sat = 5_000_000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![address_a],
@@ -148,6 +149,13 @@ async fn peer_removed_when_counterparty_force_closes_last_channel() {
 	)
 	.await;
 	node_a.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 
 	// node_a opens the channel, so node_a persists node_b in its peer store.
 	open_channel(&node_a, &node_b, 4_000_000, false, &electrsd).await;
@@ -305,7 +313,7 @@ async fn multi_hop_sending() {
 
 	let addresses = nodes.iter().map(|n| n.onchain_payment().new_address().unwrap()).collect();
 	let premine_amount_sat = 5_000_000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		addresses,
@@ -317,6 +325,15 @@ async fn multi_hop_sending() {
 		n.sync_wallets().unwrap();
 		assert_eq!(n.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
 		assert_eq!(n.next_event(), None);
+	}
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	for node in &nodes {
+		node.sync_wallets().unwrap();
+		assert_eq!(
+			node.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+			premine_txid,
+		);
 	}
 
 	// Setup channel topology:
@@ -395,7 +412,7 @@ async fn split_underpaid_bolt11_payment() {
 	let addr_b = node_b.onchain_payment().new_address().unwrap();
 	let addr_c = node_c.onchain_payment().new_address().unwrap();
 	let premine_amount_sat = 5_000_000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![addr_a, addr_b, addr_c],
@@ -406,6 +423,15 @@ async fn split_underpaid_bolt11_payment() {
 	for node in [&node_a, &node_b, &node_c] {
 		node.sync_wallets().unwrap();
 		assert_eq!(node.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
+	}
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	for node in [&node_a, &node_b, &node_c] {
+		node.sync_wallets().unwrap();
+		assert_eq!(
+			node.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+			premine_txid,
+		);
 	}
 
 	// The receiver opens both channels and pushes liquidity to both payers so each payer can send
@@ -565,7 +591,7 @@ async fn onchain_send_receive() {
 	let addr_c = unchecked_address.assume_checked();
 
 	let premine_amount_sat = 1_100_000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![addr_a.clone(), addr_b.clone()],
@@ -595,6 +621,19 @@ async fn onchain_send_receive() {
 			_ => panic!("Unexpected payment kind"),
 		}
 	}
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
+	assert_eq!(
+		node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 
 	let channel_amount_sat = 1_000_000;
 	let reserve_amount_sat = 25_000;
@@ -673,6 +712,8 @@ async fn onchain_send_receive() {
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	assert_eq!(node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await, txid,);
+	assert_eq!(node_b.expect_onchain_payment_event(OnchainPaymentEvent::Successful).await, txid,);
 
 	let expected_node_a_balance = expected_node_a_balance + amount_to_send_sats;
 	let expected_node_b_balance_lower = expected_node_b_balance_lower - amount_to_send_sats;
@@ -715,6 +756,8 @@ async fn onchain_send_receive() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	assert_eq!(node_a.expect_onchain_payment_event(OnchainPaymentEvent::Successful).await, txid,);
+	assert_eq!(node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await, txid,);
 
 	let expected_node_b_balance_lower = expected_node_b_balance_lower + expected_node_a_balance;
 	let expected_node_b_balance_upper = expected_node_b_balance_upper + expected_node_a_balance;
@@ -738,6 +781,8 @@ async fn onchain_send_receive() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	assert_eq!(node_a.expect_onchain_payment_event(OnchainPaymentEvent::Successful).await, txid,);
+	assert_eq!(node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await, txid,);
 
 	let expected_node_b_balance_lower = expected_node_b_balance_lower + reserve_amount_sat;
 	let expected_node_b_balance_upper = expected_node_b_balance_upper + reserve_amount_sat;
@@ -784,6 +829,8 @@ async fn reorged_onchain_payment_returns_to_unconfirmed() {
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	assert_eq!(node_a.next_event(), None);
+	assert_eq!(node_b.next_event(), None);
 
 	let payment_id = PaymentId(txid.to_byte_array());
 	for node in [&node_a, &node_b] {
@@ -837,7 +884,7 @@ async fn onchain_send_all_retains_reserve() {
 	let premine_amount_sat = 1_000_000;
 	let reserve_amount_sat = 25_000;
 	let onchain_fee_buffer_sat = 1000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![addr_a.clone(), addr_b.clone()],
@@ -847,6 +894,18 @@ async fn onchain_send_all_retains_reserve() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
+	assert_eq!(
+		node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
 	assert_eq!(node_b.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
 
@@ -858,6 +917,8 @@ async fn onchain_send_all_retains_reserve() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	assert_eq!(node_a.expect_onchain_payment_event(OnchainPaymentEvent::Successful).await, txid,);
+	assert_eq!(node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await, txid,);
 	// Check node a sent all and node b received it
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, 0);
 	assert!(((premine_amount_sat * 2 - onchain_fee_buffer_sat)..=(premine_amount_sat * 2))
@@ -875,6 +936,8 @@ async fn onchain_send_all_retains_reserve() {
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	assert_eq!(node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await, txid,);
+	assert_eq!(node_b.next_event(), None);
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, reserve_amount_sat);
 
 	// Open a channel.
@@ -899,6 +962,8 @@ async fn onchain_send_all_retains_reserve() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	assert_eq!(node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await, txid,);
+	assert_eq!(node_b.expect_onchain_payment_event(OnchainPaymentEvent::Successful).await, txid,);
 
 	// Check node b sent all and node a received it
 	assert_eq!(node_b.list_balances().total_onchain_balance_sats, reserve_amount_sat);
@@ -1536,7 +1601,7 @@ async fn splice_channel() {
 	let address_a = node_a.onchain_payment().new_address().unwrap();
 	let address_b = node_b.onchain_payment().new_address().unwrap();
 	let premine_amount_sat = 5_000_000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![address_a, address_b],
@@ -1549,6 +1614,18 @@ async fn splice_channel() {
 
 	assert_eq!(node_a.list_balances().total_onchain_balance_sats, premine_amount_sat);
 	assert_eq!(node_b.list_balances().total_onchain_balance_sats, premine_amount_sat);
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
+	assert_eq!(
+		node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 
 	open_channel(&node_a, &node_b, 4_000_000, false, &electrsd).await;
 
@@ -1751,7 +1828,7 @@ async fn run_rbf_splice_channel_test(confirm_original: bool) {
 	let address_a = node_a.onchain_payment().new_address().unwrap();
 	let address_b = node_b.onchain_payment().new_address().unwrap();
 	let premine_amount_sat = 5_000_000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![address_a, address_b],
@@ -1761,6 +1838,18 @@ async fn run_rbf_splice_channel_test(confirm_original: bool) {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
+	assert_eq!(
+		node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 
 	open_channel(&node_a, &node_b, 4_000_000, false, &electrsd).await;
 
@@ -1949,7 +2038,7 @@ async fn funding_payment_graduates_without_channel_ready() {
 	let address_a = node_a.onchain_payment().new_address().unwrap();
 	let address_b = node_b.onchain_payment().new_address().unwrap();
 	let premine_amount_sat = 5_000_000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![address_a, address_b],
@@ -1959,6 +2048,18 @@ async fn funding_payment_graduates_without_channel_ready() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
+	assert_eq!(
+		node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 
 	// node_a funds the channel, so it holds the funding payment. `open_channel` drains only the
 	// `ChannelPending` events, leaving any `ChannelReady` queued and undrained.
@@ -2004,7 +2105,7 @@ async fn splice_payment_reorged_to_unconfirmed() {
 	let address_a = node_a.onchain_payment().new_address().unwrap();
 	let address_b = node_b.onchain_payment().new_address().unwrap();
 	let premine_amount_sat = 5_000_000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![address_a, address_b],
@@ -2014,6 +2115,18 @@ async fn splice_payment_reorged_to_unconfirmed() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
+	assert_eq!(
+		node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 
 	open_channel(&node_a, &node_b, 4_000_000, false, &electrsd).await;
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
@@ -2081,7 +2194,7 @@ async fn splice_in_rbf_joins_counterparty_splice() {
 	let address_a = node_a.onchain_payment().new_address().unwrap();
 	let address_b = node_b.onchain_payment().new_address().unwrap();
 	let premine_amount_sat = 5_000_000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![address_a, address_b],
@@ -2091,6 +2204,18 @@ async fn splice_in_rbf_joins_counterparty_splice() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
+	assert_eq!(
+		node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 
 	open_channel(&node_a, &node_b, 4_000_000, false, &electrsd).await;
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
@@ -2129,7 +2254,7 @@ async fn simple_bolt12_send_receive() {
 
 	let address_a = node_a.onchain_payment().new_address().unwrap();
 	let premine_amount_sat = 5_000_000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![address_a],
@@ -2138,6 +2263,13 @@ async fn simple_bolt12_send_receive() {
 	.await;
 
 	node_a.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 	open_channel(&node_a, &node_b, 4_000_000, true, &electrsd).await;
 
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
@@ -2400,7 +2532,7 @@ async fn async_payment() {
 	let address_receiver_lsp = node_receiver_lsp.onchain_payment().new_address().unwrap();
 	let address_receiver = node_receiver.onchain_payment().new_address().unwrap();
 	let premine_amount_sat = 4_000_000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![address_sender, address_sender_lsp, address_receiver_lsp, address_receiver],
@@ -2412,6 +2544,15 @@ async fn async_payment() {
 	node_sender_lsp.sync_wallets().unwrap();
 	node_receiver_lsp.sync_wallets().unwrap();
 	node_receiver.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	for node in [&node_sender, &node_sender_lsp, &node_receiver_lsp, &node_receiver] {
+		node.sync_wallets().unwrap();
+		assert_eq!(
+			node.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+			premine_txid,
+		);
+	}
 
 	open_channel(&node_sender, &node_sender_lsp, 400_000, false, &electrsd).await;
 	open_channel(&node_sender_lsp, &node_receiver_lsp, 400_000, true, &electrsd).await;
@@ -2528,7 +2669,7 @@ async fn test_node_announcement_propagation() {
 
 	let address_a = node_a.onchain_payment().new_address().unwrap();
 	let premine_amount_sat = 5_000_000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![address_a],
@@ -2537,6 +2678,13 @@ async fn test_node_announcement_propagation() {
 	.await;
 
 	node_a.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 
 	// Open an announced channel from node_a to node_b
 	open_channel(&node_a, &node_b, 4_000_000, true, &electrsd).await;
@@ -2617,7 +2765,7 @@ async fn generate_bip21_uri() {
 	assert!(initial_uni_payment.contains("lightning="));
 	assert!(!initial_uni_payment.contains("lno=")); // BOLT12 requires channels
 
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![address_a],
@@ -2626,6 +2774,13 @@ async fn generate_bip21_uri() {
 	.await;
 
 	node_a.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 	open_channel(&node_a, &node_b, 4_000_000, true, &electrsd).await;
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 
@@ -2669,7 +2824,7 @@ async fn unified_send_receive_bip21_uri() {
 	let address_a = node_a.onchain_payment().new_address().unwrap();
 	let premined_sats = 5_000_000;
 
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![address_a],
@@ -2678,6 +2833,13 @@ async fn unified_send_receive_bip21_uri() {
 	.await;
 
 	node_a.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 	open_channel(&node_a, &node_b, 4_000_000, true, &electrsd).await;
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 
@@ -2718,6 +2880,7 @@ async fn unified_send_receive_bip21_uri() {
 		};
 
 	expect_payment_successful_event!(node_a, Some(offer_payment_id), None);
+	expect_payment_received_event!(node_b, expected_amount_sats * 1000);
 
 	// Cut off the BOLT12 part to fallback to BOLT11.
 	let uri_str_without_offer = uri_str.split("&lno=").next().unwrap();
@@ -2738,6 +2901,7 @@ async fn unified_send_receive_bip21_uri() {
 			},
 		};
 	expect_payment_successful_event!(node_a, Some(invoice_payment_id), None);
+	expect_payment_received_event!(node_b, expected_amount_sats * 1000);
 
 	let expect_onchain_amount_sats = 800_000;
 	let onchain_uni_payment =
@@ -2766,6 +2930,8 @@ async fn unified_send_receive_bip21_uri() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	assert_eq!(node_a.expect_onchain_payment_event(OnchainPaymentEvent::Successful).await, txid,);
+	assert_eq!(node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await, txid,);
 
 	assert_eq!(node_b.list_balances().total_onchain_balance_sats, 800_000);
 	assert_eq!(node_b.list_balances().total_lightning_balance_sats, 200_000);
@@ -2830,7 +2996,7 @@ async fn do_lsps2_client_service_integration(client_trusts_lsp: bool) {
 
 	let premine_amount_sat = 10_000_000;
 
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![service_addr, client_addr, payer_addr],
@@ -2840,6 +3006,15 @@ async fn do_lsps2_client_service_integration(client_trusts_lsp: bool) {
 	service_node.sync_wallets().unwrap();
 	client_node.sync_wallets().unwrap();
 	payer_node.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	for node in [&service_node, &client_node, &payer_node] {
+		node.sync_wallets().unwrap();
+		assert_eq!(
+			node.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+			premine_txid,
+		);
+	}
 
 	// Open a channel payer -> service that will allow paying the JIT invoice
 	println!("Opening channel payer_node -> service_node!");
@@ -3026,7 +3201,7 @@ async fn spontaneous_send_with_custom_preimage() {
 
 	let address_a = node_a.onchain_payment().new_address().unwrap();
 	let premine_sat = 1_000_000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![address_a],
@@ -3035,6 +3210,13 @@ async fn spontaneous_send_with_custom_preimage() {
 	.await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 	open_channel(&node_a, &node_b, 500_000, true, &electrsd).await;
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	node_a.sync_wallets().unwrap();
@@ -3149,7 +3331,7 @@ async fn lsps2_client_trusts_lsp() {
 
 	let premine_amount_sat = 10_000_000;
 
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![service_addr_onchain, client_addr_onchain, payer_addr_onchain],
@@ -3159,6 +3341,15 @@ async fn lsps2_client_trusts_lsp() {
 	service_node.sync_wallets().unwrap();
 	client_node.sync_wallets().unwrap();
 	payer_node.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	for node in [&service_node, &client_node, &payer_node] {
+		node.sync_wallets().unwrap();
+		assert_eq!(
+			node.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+			premine_txid,
+		);
+	}
 	println!("Premine complete!");
 	// Open a channel payer -> service that will allow paying the JIT invoice
 	open_channel(&payer_node, &service_node, 5_000_000, false, &electrsd).await;
@@ -3326,7 +3517,7 @@ async fn lsps2_lsp_trusts_client_but_client_does_not_claim() {
 
 	let premine_amount_sat = 10_000_000;
 
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![service_addr_onchain, client_addr_onchain, payer_addr_onchain],
@@ -3336,6 +3527,15 @@ async fn lsps2_lsp_trusts_client_but_client_does_not_claim() {
 	service_node.sync_wallets().unwrap();
 	client_node.sync_wallets().unwrap();
 	payer_node.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	for node in [&service_node, &client_node, &payer_node] {
+		node.sync_wallets().unwrap();
+		assert_eq!(
+			node.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+			premine_txid,
+		);
+	}
 	println!("Premine complete!");
 	// Open a channel payer -> service that will allow paying the JIT invoice
 	open_channel(&payer_node, &service_node, 5_000_000, false, &electrsd).await;
@@ -3423,7 +3623,7 @@ async fn payment_persistence_after_restart() {
 
 		// Premine sufficient funds for a large channel and many payments
 		let premine_amount_sat = 10_000_000;
-		premine_and_distribute_funds(
+		let premine_txid = premine_and_distribute_funds(
 			&bitcoind.client,
 			&electrsd.client,
 			vec![addr_a, addr_b],
@@ -3434,6 +3634,22 @@ async fn payment_persistence_after_restart() {
 		node_b.sync_wallets().unwrap();
 		assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
 		assert_eq!(node_b.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
+		generate_blocks_and_wait(
+			&bitcoind.client,
+			&electrsd.client,
+			(ANTI_REORG_DELAY - 1) as usize,
+		)
+		.await;
+		node_a.sync_wallets().unwrap();
+		node_b.sync_wallets().unwrap();
+		assert_eq!(
+			node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+			premine_txid,
+		);
+		assert_eq!(
+			node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+			premine_txid,
+		);
 
 		// Open a large channel from node_a to node_b
 		let channel_amount_sat = 5_000_000;
@@ -3704,7 +3920,7 @@ async fn onchain_fee_bump_rbf() {
 	let addr_b = node_b.onchain_payment().new_address().unwrap();
 
 	let premine_amount_sat = 500_000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![addr_a.clone(), addr_b.clone()],
@@ -3714,6 +3930,18 @@ async fn onchain_fee_bump_rbf() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
+	assert_eq!(
+		node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 
 	// Send a transaction from node_b to node_a that we'll later bump
 	let amount_to_send_sats = 100_000;
@@ -3800,6 +4028,14 @@ async fn onchain_fee_bump_rbf() {
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		second_bump_txid,
+	);
+	assert_eq!(
+		node_b.expect_onchain_payment_event(OnchainPaymentEvent::Successful).await,
+		second_bump_txid,
+	);
 
 	assert_eq!(
 		Err(NodeError::InvalidPaymentId),
@@ -3845,7 +4081,7 @@ async fn onchain_fee_bump_rbf_respects_anchor_reserve() {
 	let addr_b = node_b.onchain_payment().new_address().unwrap();
 
 	let premine_amount_sat = 1_000_000;
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![addr_a.clone(), addr_b],
@@ -3855,6 +4091,18 @@ async fn onchain_fee_bump_rbf_respects_anchor_reserve() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
+	assert_eq!(
+		node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 
 	open_channel(&node_b, &node_a, 200_000, false, &electrsd).await;
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
@@ -3895,7 +4143,7 @@ async fn open_channel_with_all_with_anchors() {
 
 	let premine_amount_sat = 1_000_000;
 
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![addr_a, addr_b],
@@ -3905,6 +4153,18 @@ async fn open_channel_with_all_with_anchors() {
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
+	assert_eq!(
+		node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 
 	let funding_txo = open_channel_with_all(&node_a, &node_b, false, &electrsd).await;
 
@@ -3948,7 +4208,7 @@ async fn open_channel_with_all_without_anchors() {
 
 	let premine_amount_sat = 1_000_000;
 
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![addr_a, addr_b],
@@ -3958,6 +4218,18 @@ async fn open_channel_with_all_without_anchors() {
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
+	assert_eq!(
+		node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 
 	let funding_txo = open_channel_with_all(&node_a, &node_b, false, &electrsd).await;
 
@@ -4000,7 +4272,7 @@ async fn splice_in_with_all_balance() {
 	let premine_amount_sat = 5_000_000;
 	let channel_amount_sat = 1_000_000;
 
-	premine_and_distribute_funds(
+	let premine_txid = premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
 		vec![addr_a, addr_b],
@@ -4010,6 +4282,18 @@ async fn splice_in_with_all_balance() {
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(
+		node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
+	assert_eq!(
+		node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
 
 	// Open a channel with a fixed amount first
 	let funding_txo = open_channel(&node_a, &node_b, channel_amount_sat, false, &electrsd).await;
