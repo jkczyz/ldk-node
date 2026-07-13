@@ -2191,6 +2191,45 @@ mod tests {
 		assert!(res.is_err());
 	}
 
+	#[test]
+	fn event_queue_read_fails_on_unknown_event_variant() {
+		use bitcoin::hashes::Hash;
+		use lightning::ln::msgs::DecodeError;
+
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(TestLogger::new());
+
+		let event = Event::OnchainPaymentSuccessful {
+			payment_id: PaymentId([42u8; 32]),
+			txid: Txid::from_byte_array([1u8; 32]),
+			amount_msat: 100_000,
+			block_hash: BlockHash::from_byte_array([2u8; 32]),
+			block_height: 4242,
+		};
+		let mut queue = VecDeque::new();
+		queue.push_back(event.clone());
+		let mut bytes = EventQueueSerWrapper(&queue).encode();
+
+		// Sanity check: the unpatched bytes deserialize fine on this version.
+		let read_queue =
+			EventQueue::read(&mut &bytes[..], (Arc::clone(&store), Arc::clone(&logger))).unwrap();
+		assert_eq!(read_queue.next_event(), Some(event));
+
+		// The queue is serialized as a big-endian u16 length followed by each event, and each
+		// event starts with a single-byte variant id (10 for `OnchainPaymentSuccessful`). Patch
+		// the id to one unknown to this version, mirroring what LDK Node v0.7 and earlier see
+		// when they read a queue containing variant 10 or 11.
+		assert_eq!(&bytes[..3], &[0, 1, 10]);
+		bytes[2] = 99;
+
+		// `Event` uses the non-upgradable `impl_writeable_tlv_based_enum`, so an unknown variant
+		// id fails the *entire* queue read instead of being skipped.
+		match EventQueue::read(&mut &bytes[..], (store, logger)) {
+			Err(e) => assert_eq!(e, DecodeError::UnknownRequiredFeature),
+			Ok(_) => panic!("expected the whole queue read to fail on an unknown variant id"),
+		}
+	}
+
 	#[tokio::test]
 	async fn event_queue_concurrency() {
 		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
@@ -2255,5 +2294,184 @@ mod tests {
 			}
 		}
 		assert_eq!(event_queue.next_event(), None);
+	}
+
+	// A store that persists everything except the event queue key, simulating a persistence
+	// failure (or a crash) between the payment store write and the event queue write in
+	// `Wallet::update_payment_store`.
+	struct EventQueueWriteFailStore {
+		inner: InMemoryStore,
+	}
+
+	impl KVStore for EventQueueWriteFailStore {
+		fn read(
+			&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+		) -> impl core::future::Future<Output = Result<Vec<u8>, lightning::io::Error>> + 'static + Send
+		{
+			KVStore::read(&self.inner, primary_namespace, secondary_namespace, key)
+		}
+
+		fn write(
+			&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
+		) -> impl core::future::Future<Output = Result<(), lightning::io::Error>> + 'static + Send
+		{
+			let inner_fut = if key == EVENT_QUEUE_PERSISTENCE_KEY {
+				None
+			} else {
+				Some(KVStore::write(&self.inner, primary_namespace, secondary_namespace, key, buf))
+			};
+			async move {
+				match inner_fut {
+					Some(fut) => fut.await,
+					None => Err(lightning::io::Error::new(
+						lightning::io::ErrorKind::Other,
+						"event queue write failed",
+					)),
+				}
+			}
+		}
+
+		fn remove(
+			&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
+		) -> impl core::future::Future<Output = Result<(), lightning::io::Error>> + 'static + Send
+		{
+			KVStore::remove(&self.inner, primary_namespace, secondary_namespace, key, lazy)
+		}
+
+		fn list(
+			&self, primary_namespace: &str, secondary_namespace: &str,
+		) -> impl core::future::Future<Output = Result<Vec<String>, lightning::io::Error>>
+		       + 'static
+		       + Send {
+			KVStore::list(&self.inner, primary_namespace, secondary_namespace)
+		}
+	}
+
+	impl lightning::util::persist::PaginatedKVStore for EventQueueWriteFailStore {
+		fn list_paginated(
+			&self, primary_namespace: &str, secondary_namespace: &str,
+			page_token: Option<lightning::util::persist::PageToken>,
+		) -> impl core::future::Future<
+			Output = Result<lightning::util::persist::PaginatedListResponse, lightning::io::Error>,
+		> + 'static
+		       + Send {
+			lightning::util::persist::PaginatedKVStore::list_paginated(
+				&self.inner,
+				primary_namespace,
+				secondary_namespace,
+				page_token,
+			)
+		}
+	}
+
+	// Reproduces the ordering hazard in `Wallet::update_payment_store`
+	// (src/wallet/mod.rs:281-296 and :321-332): the payment store is persisted (and flipped to
+	// `Succeeded`) *before* the on-chain payment event is enqueued, and emission is gated on the
+	// store reporting `updated == true`. If the event queue persist fails (or the process crashes
+	// between the two writes), the next sync's re-report of the same payment merges as a no-op
+	// (`updated == false`), so the event is never re-emitted, and a restart loads an event queue
+	// that does not contain the event: the event is lost for good.
+	//
+	// This test asserts the CORRECT behavior -- the event must still be recoverable after a
+	// restart -- and thus FAILS on this branch, demonstrating the bug.
+	#[tokio::test]
+	async fn onchain_payment_event_survives_persist_failure_and_restart() {
+		use bitcoin::hashes::Hash;
+
+		use crate::data_store::DataStore;
+		use crate::io::{
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+		};
+		use crate::payment::store::ConfirmationStatus;
+
+		let store: Arc<DynStore> =
+			Arc::new(DynStoreWrapper(EventQueueWriteFailStore { inner: InMemoryStore::new() }));
+		let logger = Arc::new(TestLogger::new());
+
+		let payment_store: DataStore<PaymentDetails, Arc<TestLogger>> = DataStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&store),
+			Arc::clone(&logger),
+		);
+		let event_queue = EventQueue::new(Arc::clone(&store), Arc::clone(&logger));
+
+		let txid = Txid::from_str(
+			"1652f260ec2a92e6a30f1097bb0fcbf00faa3d84aeaa10e2ad64f4a4ee80bdad",
+		)
+		.unwrap();
+		let block_hash = BlockHash::all_zeros();
+		let payment_id = PaymentId(txid.to_byte_array());
+		let payment = PaymentDetails::new(
+			payment_id,
+			PaymentKind::Onchain {
+				txid,
+				status: ConfirmationStatus::Confirmed {
+					block_hash,
+					height: 100,
+					timestamp: 1_000_000,
+				},
+				tx_type: None,
+			},
+			Some(100_000_000),
+			Some(10_000),
+			PaymentDirection::Inbound,
+			PaymentStatus::Succeeded,
+		);
+		let event = Event::OnchainPaymentReceived {
+			payment_id,
+			txid,
+			amount_msat: 100_000_000,
+			block_hash,
+			block_height: 100,
+		};
+
+		// Mirror `Wallet::update_payment_store`'s TxConfirmed arm: persist the payment as
+		// `Succeeded` first ...
+		let (updated, _stored) =
+			payment_store.insert_or_update_and_get(payment.clone()).await.unwrap();
+		assert!(updated);
+
+		// ... then enqueue the event -- whose KV write fails.
+		assert!(event_queue.add_event(event.clone()).await.is_err());
+
+		// In-session, the event is still in the in-memory queue (the failed persist is not rolled
+		// back), so a running node could still deliver it. The permanent loss requires a restart.
+		assert_eq!(event_queue.next_event(), Some(event.clone()));
+
+		// "Next sync": the same confirmed tx is reported again and merges as a no-op, so the
+		// `updated` gate at src/wallet/mod.rs:285 (and :326) suppresses re-emission.
+		let (updated_again, _stored) =
+			payment_store.insert_or_update_and_get(payment.clone()).await.unwrap();
+		assert!(!updated_again, "no-op merge reports updated == false; the wallet skips emission");
+
+		// Simulate a restart: reload the event queue from the KV store, as
+		// `io::utils::read_event_queue` / the builder do (src/builder.rs:1746-1756 treats a
+		// missing key as an empty queue).
+		let recovered_event = match KVStore::read(
+			&*store,
+			EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+			EVENT_QUEUE_PERSISTENCE_KEY,
+		)
+		.await
+		{
+			Ok(bytes) => EventQueue::read(&mut &bytes[..], (Arc::clone(&store), logger))
+				.ok()
+				.and_then(|q| q.next_event()),
+			Err(_) => None,
+		};
+
+		// CORRECT behavior: an event for a payment the store persisted as `Succeeded` must
+		// survive a restart. On this branch it does not, because the payment store write
+		// succeeded while the event queue write failed, and the `updated == false` gate
+		// prevents any re-emission.
+		assert_eq!(
+			recovered_event,
+			Some(event),
+			"on-chain payment event was lost: payment store says Succeeded but the event \
+			 queue was never persisted and the payment will never report updated == true again"
+		);
 	}
 }

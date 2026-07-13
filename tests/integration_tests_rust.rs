@@ -3732,6 +3732,58 @@ async fn payment_persistence_after_restart() {
 	restarted_node_a.stop().unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn onchain_payment_event_not_reemitted_after_restart() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+
+	// Setup the node manually so we can restart it with the same config.
+	let mut config = random_config(true);
+	config.store_type = TestStoreType::Sqlite;
+
+	let premine_amount_sat = 100_000;
+	let premine_txid;
+	{
+		let node = setup_node(&chain_source, config.clone());
+		let addr = node.onchain_payment().new_address().unwrap();
+		premine_txid = premine_and_distribute_funds(
+			&bitcoind.client,
+			&electrsd.client,
+			vec![addr],
+			Amount::from_sat(premine_amount_sat),
+		)
+		.await;
+		node.sync_wallets().unwrap();
+		generate_blocks_and_wait(
+			&bitcoind.client,
+			&electrsd.client,
+			(ANTI_REORG_DELAY - 1) as usize,
+		)
+		.await;
+		node.sync_wallets().unwrap();
+		assert_eq!(
+			node.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+			premine_txid,
+		);
+		assert_eq!(node.next_event(), None);
+		node.stop().unwrap();
+	}
+
+	// Restart the node from the same storage and re-sync. The settled payment's event was already
+	// emitted and consumed before the restart, so it must not be re-emitted.
+	let restarted_node = setup_node(&chain_source, config);
+	assert_eq!(restarted_node.next_event(), None);
+	restarted_node.sync_wallets().unwrap();
+	assert_eq!(restarted_node.next_event(), None);
+
+	// The payment record itself must still be there.
+	let payment = restarted_node.payment(&PaymentId(premine_txid.to_byte_array())).unwrap();
+	assert_eq!(payment.status, PaymentStatus::Succeeded);
+	assert_eq!(payment.direction, PaymentDirection::Inbound);
+
+	restarted_node.stop().unwrap();
+}
+
 enum OldLdkVersion {
 	V0_6_2,
 	V0_7_0,
@@ -4443,4 +4495,256 @@ async fn do_lsps2_multi_lsp_picks_cheapest(reverse_order: bool) {
 	client.stop().unwrap();
 	cheap.stop().unwrap();
 	expensive.stop().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn reorged_confirmation_emits_single_event_after_anti_reorg_delay() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false);
+
+	let addr_a = node_a.onchain_payment().new_address().unwrap();
+	let addr_b = node_b.onchain_payment().new_address().unwrap();
+	let premine_amount_sat = 500_000;
+	let premine_txid = premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![addr_b],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+
+	// Graduate the premine payment and drain its event so it cannot be confused with the
+	// events for the payment under test.
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(
+		node_b.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
+	assert_eq!(node_a.next_event(), None);
+	assert_eq!(node_b.next_event(), None);
+
+	let amount_to_send_sats = 100_000;
+	let txid =
+		node_b.onchain_payment().send_to_address(&addr_a, amount_to_send_sats, None).unwrap();
+	wait_for_tx(&electrsd.client, txid).await;
+
+	// Confirm the payment at H1 and sync, so both nodes record a pending entry referencing
+	// H1's block hash.
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(node_a.next_event(), None);
+	assert_eq!(node_b.next_event(), None);
+
+	let h1_height = bitcoind.client.get_blockchain_info().unwrap().blocks;
+	let h1_hash = bitcoind
+		.client
+		.get_block_hash(h1_height as u64)
+		.unwrap()
+		.block_hash()
+		.expect("block hash should be present");
+
+	// While the nodes are not syncing, reorg H1 out and re-mine so the transaction confirms
+	// in a different block (H2, same height but a different hash), then keep mining until it
+	// is ANTI_REORG_DELAY deep. The next sync observes all of this at once.
+	invalidate_blocks(&bitcoind.client, 1);
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, ANTI_REORG_DELAY as usize).await;
+
+	let h2_hash = bitcoind
+		.client
+		.get_block_hash(h1_height as u64)
+		.unwrap()
+		.block_hash()
+		.expect("block hash should be present");
+	assert_ne!(h1_hash, h2_hash);
+
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	// Exactly one event per node, carrying the block that actually confirmed the payment.
+	let event_a = node_a.expect_onchain_payment_event(OnchainPaymentEvent::Received).await;
+	assert_eq!(event_a, txid);
+	let event_b = node_b.expect_onchain_payment_event(OnchainPaymentEvent::Successful).await;
+	assert_eq!(event_b, txid);
+	assert_eq!(node_a.next_event(), None);
+	assert_eq!(node_b.next_event(), None);
+
+	// The stored payments must reference the confirming block on the current chain (H2), not
+	// the orphaned block (H1).
+	let payment_id = PaymentId(txid.to_byte_array());
+	for node in [&node_a, &node_b] {
+		let payment = node.payment(&payment_id).unwrap();
+		assert_eq!(payment.status, PaymentStatus::Succeeded);
+		match payment.kind {
+			PaymentKind::Onchain {
+				status: ConfirmationStatus::Confirmed { block_hash, .. },
+				..
+			} => {
+				assert_eq!(block_hash, h2_hash);
+			},
+			_ => panic!("Unexpected payment kind"),
+		}
+	}
+}
+/// Mines `num` blocks containing no mempool transactions (coinbase only), so that any
+/// unconfirmed transaction stays in the mempool while the chain advances.
+async fn mine_empty_blocks(
+	bitcoind: &corepc_node::Client, electrs: &impl electrsd::electrum_client::ElectrumApi,
+	num: usize,
+) {
+	let cur_height = bitcoind.get_blockchain_info().unwrap().blocks as usize;
+	let address = bitcoind.new_address().unwrap();
+	for _ in 0..num {
+		bitcoind
+			.call::<serde_json::Value>(
+				"generateblock",
+				&[json!(address.to_string()), json!([] as [&str; 0])],
+			)
+			.unwrap();
+	}
+	wait_for_block(electrs, cur_height + num).await;
+}
+
+/// Finding F3: after a >= ANTI_REORG_DELAY reorg knocks a settled on-chain receive back to
+/// Pending, re-confirmation should NOT emit a second OnchainPaymentReceived event (asserting
+/// the review's expectation of single-shot semantics; failure demonstrates re-emission).
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn verify_f3_reorg_does_not_reemit_onchain_payment_received() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+
+	let mut config = random_config(true);
+	// No channels are involved; avoid binding listening ports that may collide with
+	// concurrently running test processes.
+	config.node_config.listening_addresses = None;
+	config.node_config.node_alias = None;
+	let node = setup_node(&chain_source, config);
+
+	let premine_amount_sat = 100_000;
+	let addr = node.onchain_payment().new_address().unwrap();
+	let premine_txid = premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![addr],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+
+	node.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY - 1) as usize)
+		.await;
+	node.sync_wallets().unwrap();
+
+	// Consume the one expected event.
+	assert_eq!(
+		node.expect_onchain_payment_event(OnchainPaymentEvent::Received).await,
+		premine_txid,
+	);
+
+	let payment_id = PaymentId(premine_txid.to_byte_array());
+	assert_eq!(node.payment(&payment_id).unwrap().status, PaymentStatus::Succeeded);
+
+	// Reorg deep enough to unconfirm the tx: invalidate the ANTI_REORG_DELAY blocks that
+	// contain and bury it, then extend the replacement chain with empty blocks so the tx
+	// stays unconfirmed (in the mempool) while the node syncs.
+	invalidate_blocks(&bitcoind.client, ANTI_REORG_DELAY as usize);
+	mine_empty_blocks(&bitcoind.client, &electrsd.client, (ANTI_REORG_DELAY + 1) as usize).await;
+	node.sync_wallets().unwrap();
+
+	// Verify the settled payment was knocked back to Pending by the reorg.
+	assert_eq!(node.payment(&payment_id).unwrap().status, PaymentStatus::Pending);
+
+	// Re-confirm to ANTI_REORG_DELAY depth again.
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, ANTI_REORG_DELAY as usize).await;
+	node.sync_wallets().unwrap();
+	assert_eq!(node.payment(&payment_id).unwrap().status, PaymentStatus::Succeeded);
+
+	// The event already fired once for this payment; assert it does not fire again.
+	let mut extra_events = Vec::new();
+	while let Some(event) = node.next_event() {
+		node.event_handled().unwrap();
+		extra_events.push(event);
+	}
+	assert_eq!(
+		extra_events,
+		Vec::<Event>::new(),
+		"OnchainPaymentReceived should not be re-emitted after reorg + reconfirmation"
+	);
+}
+
+/// Finding F4: restoring a node from seed with fresh storage and doing a full rescan should
+/// not emit an OnchainPaymentReceived event for every historical transaction (asserting the
+/// review's expectation; failure demonstrates the historical-event storm).
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn verify_f4_restore_from_seed_does_not_replay_historical_events() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+
+	let mut original_config = random_config(true);
+	// No channels are involved; avoid binding listening ports that may collide with
+	// concurrently running test processes.
+	original_config.node_config.listening_addresses = None;
+	original_config.node_config.node_alias = None;
+	let original_node_entropy = original_config.node_entropy.clone();
+	let original_node = setup_node(&chain_source, original_config);
+
+	let premine_amount_sat = 100_000;
+	let addr_1 = original_node.onchain_payment().new_address().unwrap();
+	let addr_2 = original_node.onchain_payment().new_address().unwrap();
+
+	// Two separate historical receives.
+	let txid_1 = premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![addr_1],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+	let txid_2: Txid = bitcoind
+		.client
+		.send_to_address(&addr_2, Amount::from_sat(premine_amount_sat))
+		.unwrap()
+		.0
+		.parse()
+		.unwrap();
+	wait_for_tx(&electrsd.client, txid_2).await;
+
+	// Bury both transactions >= ANTI_REORG_DELAY deep.
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, ANTI_REORG_DELAY as usize).await;
+
+	original_node.stop().unwrap();
+	drop(original_node);
+
+	// Now restore from scratch: same seed, fresh storage, full rescan.
+	let mut recovered_config = random_config(true);
+	recovered_config.node_config.listening_addresses = None;
+	recovered_config.node_config.node_alias = None;
+	recovered_config.node_entropy = original_node_entropy;
+	recovered_config.wallet_rescan_from_height = Some(0);
+	let recovered_node = setup_node(&chain_source, recovered_config);
+
+	recovered_node.sync_wallets().unwrap();
+	assert_eq!(
+		recovered_node.list_balances().spendable_onchain_balance_sats,
+		premine_amount_sat * 2
+	);
+
+	// The historical transactions (txid_1, txid_2) pre-date this node instance; restoring
+	// from seed should not replay an event for each of them.
+	let mut replayed_events = Vec::new();
+	while let Some(event) = recovered_node.next_event() {
+		recovered_node.event_handled().unwrap();
+		replayed_events.push(event);
+	}
+	assert_eq!(
+		replayed_events,
+		Vec::<Event>::new(),
+		"restore-from-seed full rescan should not emit events for historical txs {} and {}",
+		txid_1,
+		txid_2,
+	);
 }

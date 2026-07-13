@@ -482,6 +482,26 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn insert_or_update_and_get_inserts_fresh_object() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(TestLogger::new());
+		let data_store: DataStore<MergingTestObject, Arc<TestLogger>> = DataStore::new(
+			Vec::new(),
+			"datastore_test_primary".to_string(),
+			"datastore_test_secondary".to_string(),
+			store,
+			logger,
+		);
+
+		// A fresh id must be inserted as-is: changed == true and the effective object is exactly
+		// the supplied one.
+		let fresh_id = TestObjectId { id: [77u8; 4] };
+		let supplied = MergingTestObject { id: fresh_id, data: [1u8; 3], preserved_data: [2u8; 3] };
+		assert_eq!(Ok((true, supplied)), data_store.insert_or_update_and_get(supplied).await);
+		assert_eq!(Some(supplied), data_store.get(&fresh_id));
+	}
+
+	#[tokio::test]
 	async fn insert_or_update_does_not_mutate_memory_if_persist_fails() {
 		let existing_id = TestObjectId { id: [42u8; 4] };
 		let existing_object = TestObject { id: existing_id, data: [23u8; 3] };
