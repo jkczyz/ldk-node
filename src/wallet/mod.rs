@@ -16,7 +16,9 @@ use bdk_wallet::descriptor::ExtendedDescriptor;
 use bdk_wallet::error::{BuildFeeBumpError, CreateTxError};
 #[allow(deprecated)]
 use bdk_wallet::SignOptions;
-use bdk_wallet::{Balance, KeychainKind, LocalOutput, PersistedWallet, Update, WalletEvent};
+use bdk_wallet::{
+	Balance, ChangeSet, KeychainKind, LocalOutput, PersistedWallet, Update, WalletEvent,
+};
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::blockdata::constants::WITNESS_SCALE_FACTOR;
 use bitcoin::blockdata::locktime::absolute::LockTime;
@@ -83,8 +85,18 @@ const DUST_LIMIT_SATS: u64 = 546;
 
 pub(crate) struct Wallet {
 	// A BDK on-chain wallet.
+	//
+	// This mutex must only be held for synchronous, I/O-free operations: other tasks acquire it
+	// synchronously from runtime worker threads (e.g., `Listen::block_connected` during chain
+	// sync, or the `WalletSource`/`CoinSelectionSource` methods driven by event handling), so
+	// blocking on store I/O while holding it can wedge all runtime workers and deadlock the node
+	// if the I/O future itself depends on a task of that runtime. Instead, extract staged changes
+	// via `take_staged` under the lock and persist them through [`Self::persist_staged_changes`]
+	// after releasing it.
 	inner: Mutex<PersistedWallet<KVStoreWalletPersister>>,
-	persister: Mutex<KVStoreWalletPersister>,
+	// The persister backing `inner`. An async mutex serializes wallet persistence while only ever
+	// parking tasks, never blocking a runtime worker thread.
+	persister: tokio::sync::Mutex<KVStoreWalletPersister>,
 	broadcaster: Arc<Broadcaster>,
 	fee_estimator: Arc<OnchainFeeEstimator>,
 	chain_source: Arc<ChainSource>,
@@ -104,7 +116,7 @@ impl Wallet {
 		logger: Arc<Logger>, pending_payment_store: Arc<PendingPaymentStore>,
 	) -> Self {
 		let inner = Mutex::new(wallet);
-		let persister = Mutex::new(wallet_persister);
+		let persister = tokio::sync::Mutex::new(wallet_persister);
 		Self {
 			inner,
 			persister,
@@ -154,24 +166,65 @@ impl Wallet {
 		BlockLocator { block_hash: checkpoint.hash(), height: checkpoint.height(), previous_blocks }
 	}
 
+	/// Persists staged wallet changes previously extracted under the wallet lock via
+	/// [`bdk_wallet::Wallet::take_staged`].
+	///
+	/// The wallet's `inner` lock must *not* be held when calling this: blocking on store I/O
+	/// while holding it can deadlock the runtime (see the field's documentation). Failed writes
+	/// are retained by the persister and retried on the next persist call, matching the
+	/// semantics of BDK's `persist_async`.
+	fn persist_staged_changes(&self, change_set_opt: Option<ChangeSet>) -> Result<(), Error> {
+		let change_set = match change_set_opt {
+			Some(change_set) => change_set,
+			None => return Ok(()),
+		};
+		self.runtime
+			.block_on(async {
+				let mut locked_persister = self.persister.lock().await;
+				locked_persister.persist(&change_set).await
+			})
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to persist wallet: {}", e);
+				Error::PersistenceFailed
+			})
+	}
+
+	/// Hands staged wallet changes over to the persister *without* writing them out yet, to be
+	/// included in the next persist call. Used on error paths that must abort before persisting,
+	/// so already-extracted changes aren't lost.
+	fn stash_staged_changes(&self, change_set_opt: Option<ChangeSet>) {
+		if let Some(change_set) = change_set_opt {
+			self.runtime.block_on(async {
+				self.persister.lock().await.stash(change_set);
+			});
+		}
+	}
+
+	/// Applies wallet-sync events to the payment stores, then persists the staged wallet changes
+	/// extracted by the caller. If updating the payment stores fails, the wallet changes are
+	/// stashed with the persister instead of written, so the persisted wallet state doesn't run
+	/// ahead of the payment stores.
+	fn update_payment_store_and_persist(
+		&self, events: Vec<WalletEvent>, change_set_opt: Option<ChangeSet>,
+	) -> Result<(), Error> {
+		match self.update_payment_store(events) {
+			Ok(()) => self.persist_staged_changes(change_set_opt),
+			Err(e) => {
+				log_error!(self.logger, "Failed to update payment store: {}", e);
+				self.stash_staged_changes(change_set_opt);
+				Err(Error::PersistenceFailed)
+			},
+		}
+	}
+
 	pub(crate) fn apply_update(&self, update: impl Into<Update>) -> Result<(), Error> {
 		let mut locked_wallet = self.inner.lock().expect("lock");
 		match locked_wallet.apply_update_events(update) {
 			Ok(events) => {
-				self.update_payment_store(&mut *locked_wallet, events).map_err(|e| {
-					log_error!(self.logger, "Failed to update payment store: {}", e);
-					Error::PersistenceFailed
-				})?;
+				let change_set_opt = locked_wallet.take_staged();
+				drop(locked_wallet);
 
-				let mut locked_persister = self.persister.lock().expect("lock");
-				self.runtime.block_on(locked_wallet.persist_async(&mut locked_persister)).map_err(
-					|e| {
-						log_error!(self.logger, "Failed to persist wallet: {}", e);
-						Error::PersistenceFailed
-					},
-				)?;
-
-				Ok(())
+				self.update_payment_store_and_persist(events, change_set_opt)
 			},
 			Err(e) => {
 				log_error!(self.logger, "Sync failed due to chain connection error: {}", e);
@@ -197,24 +250,18 @@ impl Wallet {
 			})
 			.expect("applying mempool updates cannot fail");
 
-		self.update_payment_store(&mut *locked_wallet, events).map_err(|e| {
-			log_error!(self.logger, "Failed to update payment store: {}", e);
-			Error::PersistenceFailed
-		})?;
+		let change_set_opt = locked_wallet.take_staged();
+		drop(locked_wallet);
 
-		let mut locked_persister = self.persister.lock().expect("lock");
-		self.runtime.block_on(locked_wallet.persist_async(&mut locked_persister)).map_err(|e| {
-			log_error!(self.logger, "Failed to persist wallet: {}", e);
-			Error::PersistenceFailed
-		})?;
-
-		Ok(())
+		self.update_payment_store_and_persist(events, change_set_opt)
 	}
 
-	fn update_payment_store<'a>(
-		&self, locked_wallet: &'a mut PersistedWallet<KVStoreWalletPersister>,
-		mut events: Vec<WalletEvent>,
-	) -> Result<(), Error> {
+	/// Applies wallet-sync events to the payment stores.
+	///
+	/// Callers must *not* hold the wallet's `inner` lock: the store writes performed here must
+	/// not happen under it (see the lock's documentation), and short wallet locks are taken
+	/// internally for the reads this needs.
+	fn update_payment_store(&self, mut events: Vec<WalletEvent>) -> Result<(), Error> {
 		if events.is_empty() {
 			return Ok(());
 		}
@@ -242,7 +289,7 @@ impl Wallet {
 		for event in events {
 			match event {
 				WalletEvent::TxConfirmed { txid, tx, block_time, .. } => {
-					let cur_height = locked_wallet.latest_checkpoint().height();
+					let cur_height = self.inner.lock().expect("lock").latest_checkpoint().height();
 					let confirmation_height = block_time.block_id.height;
 					let payment_status = if cur_height >= confirmation_height + ANTI_REORG_DELAY - 1
 					{
@@ -265,14 +312,17 @@ impl Wallet {
 						continue;
 					}
 
-					let payment = self.create_payment_from_tx(
-						locked_wallet,
-						txid,
-						payment_id,
-						&tx,
-						payment_status,
-						confirmation_status,
-					);
+					let payment = {
+						let locked_wallet = self.inner.lock().expect("lock");
+						self.create_payment_from_tx(
+							&locked_wallet,
+							txid,
+							payment_id,
+							&tx,
+							payment_status,
+							confirmation_status,
+						)
+					};
 
 					self.runtime.block_on(self.payment_store.insert_or_update(payment.clone()))?;
 
@@ -327,12 +377,15 @@ impl Wallet {
 					}
 
 					if !unconfirmed_outbound_txids.is_empty() {
-						let txs_to_broadcast: Vec<Transaction> = unconfirmed_outbound_txids
-							.iter()
-							.filter_map(|txid| {
-								locked_wallet.tx_details(*txid).map(|d| (*d.tx).clone())
-							})
-							.collect();
+						let txs_to_broadcast: Vec<Transaction> = {
+							let locked_wallet = self.inner.lock().expect("lock");
+							unconfirmed_outbound_txids
+								.iter()
+								.filter_map(|txid| {
+									locked_wallet.tx_details(*txid).map(|d| (*d.tx).clone())
+								})
+								.collect()
+						};
 
 						if !txs_to_broadcast.is_empty() {
 							let tx_refs: Vec<(
@@ -367,14 +420,17 @@ impl Wallet {
 						continue;
 					}
 
-					let payment = self.create_payment_from_tx(
-						locked_wallet,
-						txid,
-						payment_id,
-						&tx,
-						PaymentStatus::Pending,
-						ConfirmationStatus::Unconfirmed,
-					);
+					let payment = {
+						let locked_wallet = self.inner.lock().expect("lock");
+						self.create_payment_from_tx(
+							&locked_wallet,
+							txid,
+							payment_id,
+							&tx,
+							PaymentStatus::Pending,
+							ConfirmationStatus::Unconfirmed,
+						)
+					};
 					let pending_payment =
 						self.create_pending_payment_from_tx(payment.clone(), Vec::new());
 					self.runtime.block_on(self.payment_store.insert_or_update(payment))?;
@@ -426,14 +482,17 @@ impl Wallet {
 						continue;
 					}
 
-					let payment = self.create_payment_from_tx(
-						locked_wallet,
-						txid,
-						payment_id,
-						&tx,
-						PaymentStatus::Pending,
-						ConfirmationStatus::Unconfirmed,
-					);
+					let payment = {
+						let locked_wallet = self.inner.lock().expect("lock");
+						self.create_payment_from_tx(
+							&locked_wallet,
+							txid,
+							payment_id,
+							&tx,
+							PaymentStatus::Pending,
+							ConfirmationStatus::Unconfirmed,
+						)
+					};
 					let pending_payment =
 						self.create_pending_payment_from_tx(payment.clone(), Vec::new());
 					self.runtime.block_on(self.payment_store.insert_or_update(payment))?;
@@ -484,11 +543,9 @@ impl Wallet {
 			},
 		}
 
-		let mut locked_persister = self.persister.lock().expect("lock");
-		self.runtime.block_on(locked_wallet.persist_async(&mut locked_persister)).map_err(|e| {
-			log_error!(self.logger, "Failed to persist wallet: {}", e);
-			Error::PersistenceFailed
-		})?;
+		let change_set_opt = locked_wallet.take_staged();
+		drop(locked_wallet);
+		self.persist_staged_changes(change_set_opt)?;
 
 		let tx = psbt.extract_tx().map_err(|e| {
 			log_error!(self.logger, "Failed to extract transaction: {}", e);
@@ -500,39 +557,34 @@ impl Wallet {
 
 	pub(crate) fn get_new_address(&self) -> Result<bitcoin::Address, Error> {
 		let mut locked_wallet = self.inner.lock().expect("lock");
-		let mut locked_persister = self.persister.lock().expect("lock");
 
 		let address_info = locked_wallet.reveal_next_address(KeychainKind::External);
-		self.runtime.block_on(locked_wallet.persist_async(&mut locked_persister)).map_err(|e| {
-			log_error!(self.logger, "Failed to persist wallet: {}", e);
-			Error::PersistenceFailed
-		})?;
+		let change_set_opt = locked_wallet.take_staged();
+		drop(locked_wallet);
+
+		self.persist_staged_changes(change_set_opt)?;
 		Ok(address_info.address)
 	}
 
 	pub(crate) fn get_new_internal_address(&self) -> Result<bitcoin::Address, Error> {
 		let mut locked_wallet = self.inner.lock().expect("lock");
-		let mut locked_persister = self.persister.lock().expect("lock");
 
 		let address_info = locked_wallet.next_unused_address(KeychainKind::Internal);
-		self.runtime.block_on(locked_wallet.persist_async(&mut locked_persister)).map_err(|e| {
-			log_error!(self.logger, "Failed to persist wallet: {}", e);
-			Error::PersistenceFailed
-		})?;
+		let change_set_opt = locked_wallet.take_staged();
+		drop(locked_wallet);
+
+		self.persist_staged_changes(change_set_opt)?;
 		Ok(address_info.address)
 	}
 
 	pub(crate) fn cancel_tx(&self, tx: Transaction) -> Result<(), Error> {
 		let mut locked_wallet = self.inner.lock().expect("lock");
-		let mut locked_persister = self.persister.lock().expect("lock");
 
 		Self::cancel_tx_inner(&mut locked_wallet, tx);
-		self.runtime.block_on(locked_wallet.persist_async(&mut locked_persister)).map_err(|e| {
-			log_error!(self.logger, "Failed to persist wallet: {}", e);
-			Error::PersistenceFailed
-		})?;
+		let change_set_opt = locked_wallet.take_staged();
+		drop(locked_wallet);
 
-		Ok(())
+		self.persist_staged_changes(change_set_opt)
 	}
 
 	fn cancel_tx_inner(
@@ -752,7 +804,7 @@ impl Wallet {
 		let fee_rate =
 			fee_rate.unwrap_or_else(|| self.fee_estimator.estimate_fee_rate(confirmation_target));
 
-		let tx = {
+		let (psbt, change_set_opt) = {
 			let mut locked_wallet = self.inner.lock().expect("lock");
 
 			// Prepare the tx_builder. We properly check the reserve requirements (again) further down.
@@ -875,19 +927,16 @@ impl Wallet {
 				},
 			}
 
-			let mut locked_persister = self.persister.lock().expect("lock");
-			self.runtime.block_on(locked_wallet.persist_async(&mut locked_persister)).map_err(
-				|e| {
-					log_error!(self.logger, "Failed to persist wallet: {}", e);
-					Error::PersistenceFailed
-				},
-			)?;
-
-			psbt.extract_tx().map_err(|e| {
-				log_error!(self.logger, "Failed to extract transaction: {}", e);
-				e
-			})?
+			let change_set_opt = locked_wallet.take_staged();
+			(psbt, change_set_opt)
 		};
+
+		self.persist_staged_changes(change_set_opt)?;
+
+		let tx = psbt.extract_tx().map_err(|e| {
+			log_error!(self.logger, "Failed to extract transaction: {}", e);
+			e
+		})?;
 
 		self.broadcaster.broadcast_transactions(&[(
 			&tx,
@@ -932,7 +981,6 @@ impl Wallet {
 		&self, must_spend: Vec<Input>, must_pay_to: &[TxOut], fee_rate: FeeRate,
 	) -> Result<CoinSelection, ()> {
 		let mut locked_wallet = self.inner.lock().expect("lock");
-		let mut locked_persister = self.persister.lock().expect("lock");
 
 		debug_assert!(matches!(
 			locked_wallet.public_descriptor(KeychainKind::External),
@@ -996,12 +1044,9 @@ impl Wallet {
 			.find(|txout| must_pay_to.iter().all(|output| output != txout));
 
 		if change_output.is_some() {
-			self.runtime.block_on(locked_wallet.persist_async(&mut locked_persister)).map_err(
-				|e| {
-					log_error!(self.logger, "Failed to persist wallet: {}", e);
-					()
-				},
-			)?;
+			let change_set_opt = locked_wallet.take_staged();
+			drop(locked_wallet);
+			self.persist_staged_changes(change_set_opt).map_err(|_| ())?;
 		}
 
 		Ok(CoinSelection { confirmed_utxos, change_output })
@@ -1103,13 +1148,12 @@ impl Wallet {
 	#[allow(deprecated)]
 	fn get_change_script_inner(&self) -> Result<ScriptBuf, ()> {
 		let mut locked_wallet = self.inner.lock().expect("lock");
-		let mut locked_persister = self.persister.lock().expect("lock");
 
 		let address_info = locked_wallet.next_unused_address(KeychainKind::Internal);
-		self.runtime.block_on(locked_wallet.persist_async(&mut locked_persister)).map_err(|e| {
-			log_error!(self.logger, "Failed to persist wallet: {}", e);
-			()
-		})?;
+		let change_set_opt = locked_wallet.take_staged();
+		drop(locked_wallet);
+
+		self.persist_staged_changes(change_set_opt).map_err(|_| ())?;
 		Ok(address_info.address.script_pubkey())
 	}
 
@@ -1706,23 +1750,12 @@ impl Wallet {
 			},
 		}
 
-		let mut locked_persister = self.persister.lock().expect("lock");
-		self.runtime.block_on(locked_wallet.persist_async(&mut locked_persister)).map_err(|e| {
-			log_error!(self.logger, "Failed to persist wallet after fee bump of {}: {}", txid, e);
-			Error::PersistenceFailed
-		})?;
-
 		let fee_bumped_tx = psbt.extract_tx().map_err(|e| {
 			log_error!(self.logger, "Failed to extract fee bump transaction for {}: {}", txid, e);
 			e
 		})?;
 
 		let new_txid = fee_bumped_tx.compute_txid();
-
-		self.broadcaster.broadcast_transactions(&[(
-			&fee_bumped_tx,
-			lightning::chain::chaininterface::TransactionType::Sweep { channels: vec![] },
-		)]);
 
 		let new_payment = self.create_payment_from_tx(
 			&locked_wallet,
@@ -1733,12 +1766,25 @@ impl Wallet {
 			ConfirmationStatus::Unconfirmed,
 		);
 
+		let change_set_opt = locked_wallet.take_staged();
+		drop(locked_wallet);
+
+		self.persist_staged_changes(change_set_opt)?;
+
+		// Update the payment stores before broadcasting: wallet sync relies on finding the
+		// payment for the replacement transaction in the store once it observes it in the
+		// mempool.
 		let pending_payment_store =
 			self.create_pending_payment_from_tx(new_payment.clone(), Vec::new());
 
 		self.runtime
 			.block_on(self.pending_payment_store.insert_or_update(pending_payment_store))?;
 		self.runtime.block_on(self.payment_store.insert_or_update(new_payment))?;
+
+		self.broadcaster.broadcast_transactions(&[(
+			&fee_bumped_tx,
+			lightning::chain::chaininterface::TransactionType::Sweep { channels: vec![] },
+		)]);
 
 		log_info!(self.logger, "RBF successful: replaced {} with {}", txid, new_txid);
 
@@ -1833,13 +1879,8 @@ impl Listen for Wallet {
 			}
 		}
 
-		match locked_wallet.apply_block_events(block, height) {
-			Ok(events) => {
-				if let Err(e) = self.update_payment_store(&mut *locked_wallet, events) {
-					log_error!(self.logger, "Failed to update payment store: {}", e);
-					return;
-				}
-			},
+		let events = match locked_wallet.apply_block_events(block, height) {
+			Ok(events) => events,
 			Err(e) => {
 				log_error!(
 					self.logger,
@@ -1850,14 +1891,11 @@ impl Listen for Wallet {
 			},
 		};
 
-		let mut locked_persister = self.persister.lock().expect("lock");
-		match self.runtime.block_on(locked_wallet.persist_async(&mut locked_persister)) {
-			Ok(_) => (),
-			Err(e) => {
-				log_error!(self.logger, "Failed to persist on-chain wallet: {}", e);
-				return;
-			},
-		};
+		let change_set_opt = locked_wallet.take_staged();
+		drop(locked_wallet);
+
+		// Errors are logged internally.
+		let _ = self.update_payment_store_and_persist(events, change_set_opt);
 	}
 
 	fn blocks_disconnected(&self, _fork_point_block: BlockLocator) {
