@@ -22,13 +22,14 @@ use crate::types::DynStore;
 
 pub(crate) struct KVStoreWalletPersister {
 	latest_change_set: Option<ChangeSet>,
+	pending_change_set: ChangeSet,
 	kv_store: Arc<DynStore>,
 	logger: Arc<Logger>,
 }
 
 impl KVStoreWalletPersister {
 	pub(crate) fn new(kv_store: Arc<DynStore>, logger: Arc<Logger>) -> Self {
-		Self { latest_change_set: None, kv_store, logger }
+		Self { latest_change_set: None, pending_change_set: ChangeSet::default(), kv_store, logger }
 	}
 
 	async fn initialize_inner(&mut self) -> Result<ChangeSet, std::io::Error> {
@@ -169,6 +170,20 @@ impl KVStoreWalletPersister {
 
 		Ok(())
 	}
+
+	pub(super) async fn persist_changeset(
+		&mut self, change_set: ChangeSet,
+	) -> Result<(), std::io::Error> {
+		let mut pending_change_set = std::mem::take(&mut self.pending_change_set);
+		pending_change_set.merge(change_set);
+		match self.persist_inner(&pending_change_set).await {
+			Ok(()) => Ok(()),
+			Err(e) => {
+				self.pending_change_set = pending_change_set;
+				Err(e)
+			},
+		}
+	}
 }
 
 impl AsyncWalletPersister for KVStoreWalletPersister {
@@ -190,5 +205,41 @@ impl AsyncWalletPersister for KVStoreWalletPersister {
 		Self: 'a,
 	{
 		Box::pin(persister.persist_inner(change_set))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::Arc;
+
+	use bdk_wallet::{AsyncWalletPersister, ChangeSet, Wallet as BdkWallet};
+	use bitcoin::Network;
+
+	use super::KVStoreWalletPersister;
+	use crate::io::test_utils::InMemoryStore;
+	use crate::logger::Logger;
+	use crate::types::{DynStore, DynStoreWrapper};
+
+	#[tokio::test]
+	async fn retries_changes_after_persistence_failure() {
+		const EXTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/0/*)";
+		const INTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/1/*)";
+
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(Logger::new_log_facade());
+		let mut persister = KVStoreWalletPersister::new(Arc::clone(&store), Arc::clone(&logger));
+		let mut wallet = BdkWallet::create(EXTERNAL_DESCRIPTOR, INTERNAL_DESCRIPTOR)
+			.network(Network::Regtest)
+			.create_wallet_no_persist()
+			.unwrap();
+		let change_set = wallet.take_staged().unwrap();
+
+		assert!(persister.persist_changeset(change_set).await.is_err());
+		AsyncWalletPersister::initialize(&mut persister).await.unwrap();
+		persister.persist_changeset(ChangeSet::default()).await.unwrap();
+
+		let mut reloaded_persister = KVStoreWalletPersister::new(store, logger);
+		let reloaded = AsyncWalletPersister::initialize(&mut reloaded_persister).await.unwrap();
+		assert_eq!(reloaded.network, Some(Network::Regtest));
 	}
 }
