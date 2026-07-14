@@ -210,21 +210,118 @@ impl AsyncWalletPersister for KVStoreWalletPersister {
 
 #[cfg(test)]
 mod tests {
+	use std::future::Future;
 	use std::sync::Arc;
+	use std::time::Duration;
 
 	use bdk_wallet::{AsyncWalletPersister, ChangeSet, Wallet as BdkWallet};
 	use bitcoin::Network;
+	use lightning::io;
+	use lightning::util::persist::{KVStore, PageToken, PaginatedKVStore, PaginatedListResponse};
 
 	use super::KVStoreWalletPersister;
 	use crate::io::test_utils::InMemoryStore;
 	use crate::logger::Logger;
 	use crate::types::{DynStore, DynStoreWrapper};
 
+	const EXTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/0/*)";
+	const INTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/1/*)";
+
+	// Delegates to `InMemoryStore`, but parks every write on an async gate so a test can hold a
+	// persist in-flight at an await point and then drop it, as `tokio::select!` losing to the
+	// stop signal or `JoinSet::abort_all` does on shutdown.
+	#[derive(Clone)]
+	struct GatedStore {
+		inner: Arc<InMemoryStore>,
+		write_gate: Arc<tokio::sync::RwLock<()>>,
+	}
+
+	impl KVStore for GatedStore {
+		fn read(
+			&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
+		) -> impl Future<Output = Result<Vec<u8>, io::Error>> + 'static + Send {
+			KVStore::read(&*self.inner, primary_namespace, secondary_namespace, key)
+		}
+
+		fn write(
+			&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
+		) -> impl Future<Output = Result<(), io::Error>> + 'static + Send {
+			let inner = Arc::clone(&self.inner);
+			let write_gate = Arc::clone(&self.write_gate);
+			let primary_namespace = primary_namespace.to_string();
+			let secondary_namespace = secondary_namespace.to_string();
+			let key = key.to_string();
+			async move {
+				let _guard = write_gate.read().await;
+				KVStore::write(&*inner, &primary_namespace, &secondary_namespace, &key, buf).await
+			}
+		}
+
+		fn remove(
+			&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
+		) -> impl Future<Output = Result<(), io::Error>> + 'static + Send {
+			KVStore::remove(&*self.inner, primary_namespace, secondary_namespace, key, lazy)
+		}
+
+		fn list(
+			&self, primary_namespace: &str, secondary_namespace: &str,
+		) -> impl Future<Output = Result<Vec<String>, io::Error>> + 'static + Send {
+			KVStore::list(&*self.inner, primary_namespace, secondary_namespace)
+		}
+	}
+
+	impl PaginatedKVStore for GatedStore {
+		fn list_paginated(
+			&self, primary_namespace: &str, secondary_namespace: &str,
+			page_token: Option<PageToken>,
+		) -> impl Future<Output = Result<PaginatedListResponse, io::Error>> + 'static + Send {
+			PaginatedKVStore::list_paginated(
+				&*self.inner,
+				primary_namespace,
+				secondary_namespace,
+				page_token,
+			)
+		}
+	}
+
+	#[tokio::test]
+	async fn retains_pending_changes_when_persist_is_cancelled() {
+		let gated_store = GatedStore {
+			inner: Arc::new(InMemoryStore::new()),
+			write_gate: Arc::new(tokio::sync::RwLock::new(())),
+		};
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(gated_store.clone()));
+		let logger = Arc::new(Logger::new_log_facade());
+		let mut persister = KVStoreWalletPersister::new(Arc::clone(&store), Arc::clone(&logger));
+		AsyncWalletPersister::initialize(&mut persister).await.unwrap();
+
+		let mut wallet = BdkWallet::create(EXTERNAL_DESCRIPTOR, INTERNAL_DESCRIPTOR)
+			.network(Network::Regtest)
+			.create_wallet_no_persist()
+			.unwrap();
+		let change_set = wallet.take_staged().unwrap();
+
+		// Hold the write gate so the persist parks on store I/O, then drop the in-flight future.
+		let gate_guard = gated_store.write_gate.write().await;
+		{
+			let persist_fut = persister.persist_changeset(change_set);
+			tokio::pin!(persist_fut);
+			let poll_res = tokio::time::timeout(Duration::from_millis(100), &mut persist_fut).await;
+			assert!(poll_res.is_err(), "persist should be parked on the gated store write");
+		}
+		drop(gate_guard);
+
+		// The cancelled change set must be retained and flushed by a later persist call, just
+		// like a failed one is in `retries_changes_after_persistence_failure`.
+		persister.persist_changeset(ChangeSet::default()).await.unwrap();
+
+		let mut reloaded_persister = KVStoreWalletPersister::new(store, logger);
+		let reloaded = AsyncWalletPersister::initialize(&mut reloaded_persister).await.unwrap();
+		assert_eq!(reloaded.network, Some(Network::Regtest));
+	}
+
 	#[tokio::test]
 	async fn retries_changes_after_persistence_failure() {
-		const EXTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/0/*)";
-		const INTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/1/*)";
-
 		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
 		let logger = Arc::new(Logger::new_log_facade());
 		let mut persister = KVStoreWalletPersister::new(Arc::clone(&store), Arc::clone(&logger));
