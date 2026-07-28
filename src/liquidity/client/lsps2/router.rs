@@ -304,6 +304,38 @@ mod tests {
 	}
 
 	#[test]
+	fn jit_path_includes_lsps2_min_final_cltv_buffer() {
+		// bLIP-52 requires the client to allow a `min_final_cltv_expiry_delta` at least 2 blocks
+		// higher than usual so blocks mined while the LSP opens the JIT channel don't make the
+		// recipient fail the HTLC back; cf. the BOLT11 JIT path in the parent module. The final
+		// delta the payer budgets for is baked into the path's aggregated
+		// `payinfo.cltv_expiry_delta` together with the LSP hop's delta.
+		let parameters = LSPS2LeaseParameters {
+			lsp_node_id: pubkey(11),
+			intercept_scid: 42,
+			cltv_expiry_delta: 48,
+			payment_size_msat: Some(3_000),
+			valid_until: u64::MAX,
+		};
+		let metadata = payment_metadata(parameters);
+		let inner_router = MockRouter { calls: AtomicUsize::new(0), return_regular_path: false };
+		let router = LSPS2Router::new(inner_router, TestEntropy);
+
+		let paths = router
+			.create_blinded_payment_paths(
+				pubkey(10),
+				ReceiveAuthKey([3; 32]),
+				Vec::new(),
+				payment_tlvs(metadata),
+				Some(3_000),
+				&Secp256k1::new(),
+			)
+			.unwrap();
+
+		assert_eq!(paths[0].payinfo.cltv_expiry_delta, 48 + MIN_FINAL_CLTV_EXPIRY_DELTA + 2);
+	}
+
+	#[test]
 	fn rejects_fixed_jit_path_for_another_amount() {
 		let parameters = LSPS2LeaseParameters {
 			lsp_node_id: pubkey(11),
