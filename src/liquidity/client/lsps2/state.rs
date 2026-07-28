@@ -568,6 +568,19 @@ mod tests {
 	}
 
 	#[test]
+	fn freshly_negotiated_short_validity_leases_are_consumable() {
+		// `consume_lease` looks a just-bought lease up via `valid()` immediately after the buy
+		// (see `acquire_fixed_lease`/`acquire_variable_lease`), so the cache-freshness margin
+		// must not apply to it: an LSP whose opening params are valid for another 12 hours will
+		// happily honor a payment made right now.
+		let lease = lease(2, 51, 1, Some(1_000), now_secs() + 12 * 60 * 60);
+		let id = lease.id;
+		let mut state = LSPS2LeaseState::default();
+		state.insert(lease);
+		assert!(state.valid(&id).is_some());
+	}
+
+	#[test]
 	fn payment_leases_roundtrip() {
 		let lease = lease(2, 48, 100, Some(1_000), now_secs() + MIN_LEASE_REMAINING_SECS + 60);
 
