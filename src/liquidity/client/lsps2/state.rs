@@ -487,6 +487,7 @@ mod tests {
 	use crate::io::{
 		LSPS2_CACHE_TARGET_PERSISTENCE_KEY, LSPS2_CACHE_TARGET_PERSISTENCE_PRIMARY_NAMESPACE,
 		LSPS2_CACHE_TARGET_PERSISTENCE_SECONDARY_NAMESPACE,
+		LSPS2_LEASE_PERSISTENCE_PRIMARY_NAMESPACE, LSPS2_LEASE_PERSISTENCE_SECONDARY_NAMESPACE,
 	};
 	use crate::types::{DynStore, DynStoreWrapper};
 
@@ -578,6 +579,56 @@ mod tests {
 		let mut state = LSPS2LeaseState::default();
 		state.insert(lease);
 		assert!(state.valid(&id).is_some());
+	}
+
+	#[tokio::test]
+	async fn selected_leases_cannot_be_consumed_twice() {
+		// Selection (`fixed_amount`/`variable_amount`) does not remove the lease, and consumption
+		// awaits the persisted removal before updating the in-memory state, so two requests can
+		// select the same single-use lease before either consumes it (the cached fast path runs
+		// outside the per-key request lock). Once both have selected it, the second consumption
+		// must fail rather than hand the same intercept SCID to a second payment.
+		let lease = lease(2, 52, 1, Some(1_000), now_secs() + MIN_LEASE_REMAINING_SECS + 60);
+		let kv_store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let lease_store = PaymentLeaseStore::new(
+			vec![lease.clone()],
+			LSPS2_LEASE_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			LSPS2_LEASE_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			kv_store,
+			Arc::new(TestLogger::new()),
+		);
+		let mut state = LSPS2LeaseState::from_leases(vec![lease]);
+
+		// Both requests select the lease before either starts consuming it.
+		let (first, _) = state.fixed_amount(1_000, None).unwrap();
+		let (second, _) = state.fixed_amount(1_000, None).unwrap();
+		assert_eq!(first.id, second.id);
+
+		let result = super::super::consume_after_persisted_removal(
+			first,
+			|lease| {
+				let lease_store = &lease_store;
+				async move { lease_store.remove(&lease.id).await }
+			},
+			|lease| {
+				state.remove(&lease.id);
+			},
+		)
+		.await;
+		assert!(result.is_ok());
+
+		let result = super::super::consume_after_persisted_removal(
+			second,
+			|lease| {
+				let lease_store = &lease_store;
+				async move { lease_store.remove(&lease.id).await }
+			},
+			|lease| {
+				state.remove(&lease.id);
+			},
+		)
+		.await;
+		assert!(result.is_err(), "single-use lease was handed out twice");
 	}
 
 	#[test]
