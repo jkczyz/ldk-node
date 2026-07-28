@@ -1511,6 +1511,40 @@ mod tests {
 		assert_eq!(payment.status, PaymentStatus::Failed);
 	}
 
+	#[test]
+	fn inbound_bolt12_payments_can_be_failed() {
+		// `EventHandler::fail_claimable_payment` applies exactly this update when refusing a
+		// claimable payment, e.g. when the LSP withheld more than the authorized LSPS2 opening
+		// fee from a BOLT12 JIT payment. Failing an inbound BOLT12 payment must not trip the
+		// outbound-only payment hash assertion.
+		let payment_id = PaymentId([41; 32]);
+		let hash = PaymentHash([42; 32]);
+		let mut payment = PaymentDetails::new(
+			payment_id,
+			PaymentKind::Bolt12Offer {
+				hash: Some(hash),
+				preimage: None,
+				secret: None,
+				counterparty_skimmed_fee_msat: None,
+				offer_id: OfferId([43; 32]),
+				payer_note: None,
+				quantity: None,
+			},
+			Some(100_000),
+			None,
+			PaymentDirection::Inbound,
+			PaymentStatus::Pending,
+		);
+
+		payment.update(PaymentDetailsUpdate {
+			hash: Some(Some(hash)),
+			status: Some(PaymentStatus::Failed),
+			..PaymentDetailsUpdate::new(payment_id)
+		});
+
+		assert_eq!(payment.status, PaymentStatus::Failed);
+	}
+
 	#[derive(Clone, Debug, PartialEq, Eq)]
 	struct LegacyBolt11JitKind {
 		hash: PaymentHash,
