@@ -1572,6 +1572,24 @@ impl Wallet {
 		Ok(())
 	}
 
+	/// Returns the `PaymentId` of a user-initiated splice intent for one of the channels in
+	/// `candidate`, if any, so a classified splice adopts the id chosen at splice time rather than
+	/// deriving one from the first candidate's txid. A fee bump reuses the channel's existing intent,
+	/// so at most one in-flight intent matches and the first is unambiguous.
+	fn find_splice_payment_id(&self, candidate: &FundingCandidate) -> Option<PaymentId> {
+		self.pending_payment_store
+			.list_filter(|p| {
+				p.splice_intent().is_some_and(|intent| {
+					candidate.channels.iter().any(|channel| {
+						channel.channel_id == intent.channel_id
+							&& channel.counterparty_node_id == intent.counterparty_node_id
+					})
+				})
+			})
+			.first()
+			.map(|p| p.id())
+	}
+
 	/// Records an interactive-funding broadcast (splice, or a V2 dual-funded open) as a pending
 	/// on-chain payment, tagged with its transaction type. Amount and fee are this node's share,
 	/// derived from the active candidate's contributions; broadcasts we didn't contribute to, or
@@ -1622,9 +1640,18 @@ impl Wallet {
 			return Ok(());
 		}
 
-		// Anchor the `PaymentId` to the first negotiated candidate so the record stays stable
-		// across RBF replacements.
-		let payment_id = PaymentId(first.txid.to_byte_array());
+		// Adopt the `PaymentId` generated when the splice was initiated so its retry intent, funding
+		// payment, and candidate history share one record. If the intent is already gone (e.g. the
+		// splice locked before this classification ran), adopt the id of a record wallet sync
+		// created for any candidate rather than minting a divergent one. Fall back to the first
+		// negotiated candidate's txid for splices we did not originate (counterparty-initiated or
+		// V2 opens), which keeps that id stable across RBF replacements.
+		let payment_id = self
+			.find_splice_payment_id(active)
+			.or_else(|| {
+				candidates.iter().find_map(|candidate| self.find_payment_by_txid(candidate.txid))
+			})
+			.unwrap_or_else(|| PaymentId(first.txid.to_byte_array()));
 
 		// Record every candidate's figures (`None` for any round we didn't contribute to, e.g. a
 		// counterparty-initiated splice our `splice_in` later joined via RBF) so the confirmed
@@ -1751,23 +1778,45 @@ impl Wallet {
 		self.pending_payment_store
 			.mutate(&id, |existing| {
 				// The record was written above and payment records are never removed, so absence
-				// means the write failed out; fall back to the fresh details.
+				// means the write failed out; fall back to the fresh details. A promoted or
+				// (re)created entry embeds this post-write record rather than the fresh
+				// Unconfirmed details, so a confirmation wallet sync already recorded keeps
+				// driving graduation.
 				let recorded = self.payment_store.get(&id).unwrap_or(details);
 				match existing {
-					// The inserted entry embeds the post-write record rather than the fresh
-					// details, so a confirmation wallet sync already recorded keeps driving
-					// graduation.
-					None if recorded.status == PaymentStatus::Pending => {
-						Some(PendingPaymentDetails::new(recorded, Vec::new(), candidates))
+					// First time we record this funding payment — or a crash between the two
+					// store writes left a Pending record with no index entry: (re)create it so
+					// the payment can graduate and its candidate txids stay mapped. A graduated
+					// payment is never `Pending`, so absence with an advanced record means the
+					// graduation path removed the entry and it must not be re-indexed.
+					None => (recorded.status == PaymentStatus::Pending).then(|| {
+						PendingPaymentDetails::tracked(recorded, Vec::new(), candidates, None)
+					}),
+					// A user-initiated splice has a pre-broadcast `PendingSplice` intent under
+					// this id; carry its intent into the `Tracked` record so the retrier can
+					// still clear it once the splice locks. If the payment already advanced
+					// beyond `Pending` (wallet sync confirmed it through `ANTI_REORG_DELAY`
+					// first), it must not enter the pending store; the intent stays for
+					// `ChannelReady` or `reconcile` to clear.
+					Some(PendingPaymentDetails::PendingSplice { intent, .. }) => {
+						if recorded.status == PaymentStatus::Pending {
+							Some(PendingPaymentDetails::tracked(
+								recorded,
+								Vec::new(),
+								candidates,
+								Some(intent.clone()),
+							))
+						} else {
+							None
+						}
 					},
-					// The payment already advanced beyond Pending: the graduation path removed
-					// the entry and it must not be re-created.
-					None => None,
-					// The entry predates this classification — wallet sync recorded the
-					// transaction before it was classified (its arms and this write pair
-					// serialize on the cross-store lock, so nothing lands in between): merge
-					// only the classification into the existing entry.
-					Some(entry) => {
+					// An earlier candidate's classification or wallet sync recorded this payment
+					// before this classification ran (sync's arms and this write pair serialize
+					// on the cross-store lock, so nothing lands in between): merge only the
+					// classification (`tx_type`, candidate history and the figures of whichever
+					// candidate the record's state makes authoritative) into it.
+					Some(tracked @ PendingPaymentDetails::Tracked { .. }) => {
+						let mut updated = tracked.clone();
 						let pending_update = PendingPaymentDetailsUpdate {
 							id,
 							payment_update: Some(update),
@@ -1775,7 +1824,6 @@ impl Wallet {
 							candidates,
 							splice_intent: None,
 						};
-						let mut updated = entry.clone();
 						updated.update(pending_update).then_some(updated)
 					},
 				}
@@ -1907,8 +1955,9 @@ impl Wallet {
 					|d| matches!(d.kind, PaymentKind::Onchain { txid, .. } if txid == target_txid),
 				) || p.conflicting_txids().contains(&target_txid)
 					// A middle RBF round is not the record's current txid and may never have
-					// received a `TxReplaced` event of its own, so map any of its candidate
-					// txids (an earlier RBF round may confirm) back to the record.
+					// received a `TxReplaced` event of its own, and a splice keyed by a generated
+					// PaymentId is not found by the txid-derived id above: map any of the
+					// candidate txids (an earlier RBF round may confirm) back to the record.
 					|| p.candidate(target_txid).is_some()
 			})
 			.first()
