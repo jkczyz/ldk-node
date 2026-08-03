@@ -1860,6 +1860,25 @@ impl Wallet {
 		Ok(())
 	}
 
+	/// Returns the `PaymentId` of a user-initiated splice intent for one of the channels in
+	/// `candidate`, if any, so a classified splice adopts the id chosen at splice time rather than
+	/// deriving one from the first candidate's txid. A fee bump reuses the channel's existing intent,
+	/// so at most one in-flight intent matches and the first is unambiguous.
+	async fn find_splice_payment_id(&self, candidate: &FundingCandidate) -> Option<PaymentId> {
+		self.pending_payment_store
+			.list_filter(|p| {
+				p.splice_intent().is_some_and(|intent| {
+					candidate.channels.iter().any(|channel| {
+						channel.channel_id == intent.channel_id
+							&& channel.counterparty_node_id == intent.counterparty_node_id
+					})
+				})
+			})
+			.await
+			.first()
+			.map(|p| p.id())
+	}
+
 	/// Records an interactive-funding broadcast (splice, or a V2 dual-funded open) as a pending
 	/// on-chain payment, tagged with its transaction type. Amount and fee are this node's share,
 	/// derived from the active candidate's contributions; broadcasts we didn't contribute to, or
@@ -1911,16 +1930,20 @@ impl Wallet {
 		// and the write below would create a divergent record.
 		let guard = self.funding_payment_update_lock.lock().await;
 
-		// Adopt the id of a record that already tracks any negotiated round (wallet sync may
-		// record a round before this classification runs); otherwise generate a fresh id. An id
-		// derived from a txid would tie the record's identity to one round of a replaceable
-		// transaction — resolution through the record's txid history is what keeps its identity
-		// stable across RBF replacements.
-		let mut resolved_id = None;
-		for candidate in candidates.iter() {
-			if let Some(id) = self.find_payment_by_txid(candidate.txid).await? {
-				resolved_id = Some(id);
-				break;
+		// Adopt the `PaymentId` generated when the splice was initiated so its splice intent,
+		// funding payment, and candidate history share one record. If the intent is already gone
+		// (e.g. the splice locked before this classification ran), adopt the id of a record wallet
+		// sync created for any candidate rather than creating a divergent one; otherwise generate
+		// a fresh id — an id derived from a txid would tie the record's identity to one round of a
+		// replaceable transaction, and resolution through the record's txid history is what keeps
+		// its identity stable across RBF replacements.
+		let mut resolved_id = self.find_splice_payment_id(active).await;
+		if resolved_id.is_none() {
+			for candidate in candidates.iter() {
+				if let Some(id) = self.find_payment_by_txid(candidate.txid).await? {
+					resolved_id = Some(id);
+					break;
+				}
 			}
 		}
 		let payment_id = resolved_id.unwrap_or_else(random_payment_id);
@@ -2068,13 +2091,16 @@ impl Wallet {
 		self.pending_payment_store
 			.mutate_async(&id, move |existing| async move {
 				// The record was written above and payment records are never removed, so absence
-				// means the write failed out; fall back to the fresh details.
+				// means the write failed out; fall back to the fresh details. A promoted or
+				// (re)created entry embeds this post-write record rather than the fresh
+				// Unconfirmed details, so a confirmation wallet sync already recorded keeps
+				// driving graduation.
 				let recorded = payment_store.get(&id).await?.unwrap_or(details);
 				// A candidate history that lacks the record's current txid is stale — a queued
 				// classification retrying after a newer round classified. The merge arm below
-				// refuses such a history; recreating a missing entry from it would smuggle it
-				// past that refusal, so leave the recreation to a fresh classification (the
-				// newer round's own write, or its retry) instead.
+				// refuses such a history; creating or promoting an entry from it would smuggle
+				// it past that refusal, so leave that to a fresh classification (the newer
+				// round's own write, or its retry) instead.
 				let stale = match &recorded.kind {
 					PaymentKind::Onchain { txid, .. } if !candidates.is_empty() => {
 						!candidates.iter().any(|c| c.txid == *txid)
@@ -2082,20 +2108,40 @@ impl Wallet {
 					_ => false,
 				};
 				Ok(match existing {
-					// The inserted entry embeds the post-write record rather than the fresh
-					// details, so a confirmation wallet sync already recorded keeps driving
-					// graduation.
-					None if recorded.status == PaymentStatus::Pending && !stale => {
-						Some(PendingPaymentDetails::new(recorded, Vec::new(), candidates))
+					// First time we record this funding payment — or a crash between the two
+					// store writes left a Pending record with no index entry: (re)create it so
+					// the payment can graduate and its candidate txids stay mapped. A graduated
+					// payment is never `Pending`, so absence with an advanced record means the
+					// graduation path removed the entry and it must not be re-indexed.
+					None => (recorded.status == PaymentStatus::Pending && !stale).then(|| {
+						PendingPaymentDetails::tracked(recorded, Vec::new(), candidates, None)
+					}),
+					// A user-initiated splice has a pre-broadcast `PendingSplice` intent under
+					// this id; carry its intent into the `Tracked` record so promotion does
+					// not drop it (nothing persists or consumes intents yet — that arrives
+					// with the follow-up that makes splice retries survive restarts). If the
+					// payment already advanced beyond `Pending` (wallet sync confirmed it
+					// through `ANTI_REORG_DELAY` first), it must not enter the pending store;
+					// the leftover intent record stays until that follow-up adds its clearing
+					// path.
+					Some(PendingPaymentDetails::PendingSplice { intent, .. }) => {
+						if recorded.status == PaymentStatus::Pending && !stale {
+							Some(PendingPaymentDetails::tracked(
+								recorded,
+								Vec::new(),
+								candidates,
+								Some(intent),
+							))
+						} else {
+							None
+						}
 					},
-					// The payment already advanced beyond Pending: the graduation path removed
-					// the entry and it must not be re-created.
-					None => None,
-					// The entry predates this classification — wallet sync recorded the
-					// transaction before it was classified (its arms and this write pair
-					// serialize on the cross-store lock, so nothing lands in between): merge
-					// only the classification into the existing entry.
-					Some(mut entry) => {
+					// An earlier candidate's classification or wallet sync recorded this payment
+					// before this classification ran (sync's arms and this write pair serialize
+					// on the cross-store lock, so nothing lands in between): merge only the
+					// classification (`tx_type`, candidate history and the figures of whichever
+					// candidate the record's state makes authoritative) into it.
+					Some(mut tracked @ PendingPaymentDetails::Tracked { .. }) => {
 						let pending_update = PendingPaymentDetailsUpdate {
 							id,
 							payment_update: Some(update),
@@ -2103,7 +2149,7 @@ impl Wallet {
 							candidates,
 							splice_intent: None,
 						};
-						entry.update(pending_update).then_some(entry)
+						tracked.update(pending_update).then_some(tracked)
 					},
 				})
 			})
@@ -2201,7 +2247,7 @@ impl Wallet {
 					// Promote a pre-broadcast splice intent: wallet sync saw the splice
 					// transaction before its broadcast-time classification recorded it. Carrying
 					// the intent into the `Tracked` record makes the entry visible to txid
-					// lookups while the retrier keeps the intent until the splice locks.
+					// lookups while preserving the intent.
 					Some(PendingPaymentDetails::PendingSplice { intent, .. }) => {
 						Some(PendingPaymentDetails::tracked(
 							payment,
@@ -2234,8 +2280,9 @@ impl Wallet {
 					|d| matches!(d.kind, PaymentKind::Onchain { txid, .. } if txid == target_txid),
 				) || p.conflicting_txids().contains(&target_txid)
 					// A middle RBF round is not the record's current txid and may never have
-					// received a `TxReplaced` event of its own, so map any of its candidate
-					// txids (an earlier RBF round may confirm) back to the record.
+					// received a `TxReplaced` event of its own, and a splice keyed by a generated
+					// PaymentId is not found by the txid-derived id above: map any of the
+					// candidate txids (an earlier RBF round may confirm) back to the record.
 					|| p.candidate(target_txid).is_some()
 			})
 			.await
@@ -5264,6 +5311,53 @@ mod tests {
 		wallet.update_payment_store(vec![event]).await.unwrap();
 		wallet.classify_funding(&tx, &channels, tx_type).await.unwrap();
 		assert_unchanged(&wallet, payment_id, true).await;
+	}
+
+	/// A user-initiated splice's record is keyed by the PaymentId chosen at splice time, not by
+	/// its funding txid. The generic funding path must resolve a rebroadcast of that funding tx
+	/// back to the existing record rather than creating a duplicate under the txid-derived id.
+	#[tokio::test]
+	async fn classify_funding_resolves_the_splice_time_payment_id() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+
+		let script_pubkey = wallet
+			.inner
+			.lock()
+			.unwrap()
+			.reveal_next_address(KeychainKind::External)
+			.address
+			.script_pubkey();
+		let tx = Transaction {
+			version: bitcoin::transaction::Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: Vec::new(),
+			output: vec![TxOut { value: Amount::from_sat(10_000), script_pubkey }],
+		};
+		let txid = tx.compute_txid();
+
+		let payment_id = PaymentId([21u8; 32]);
+		let candidates = vec![FundingTxCandidate {
+			txid,
+			amount_msat: Some(1_000_000),
+			fee_paid_msat: Some(500),
+		}];
+		let details = interactive_funding_details(payment_id, txid, Some(1_000_000), Some(500));
+		wallet.persist_funding_payment(details, candidates).await.unwrap();
+
+		let counterparty_node_id = PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.unwrap();
+		let channels = vec![(counterparty_node_id, ChannelId([7u8; 32]))];
+		let tx_type = TransactionType::Funding { channels: vec![] };
+		wallet.classify_funding(&tx, &channels, tx_type).await.unwrap();
+
+		let payments = wallet.payment_store.list_page(None).await.unwrap().objects;
+		assert_eq!(payments.len(), 1, "the rebroadcast must not create a second record");
+		assert_eq!(payments[0].id, payment_id);
+		assert_eq!(payments[0].amount_msat, Some(1_000_000));
+		assert_eq!(payments[0].fee_paid_msat, Some(500));
 	}
 
 	/// A funding broadcast whose classification fails must be retried, not dropped: for
