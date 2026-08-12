@@ -3846,7 +3846,7 @@ async fn bolt12_lsps2_client_service_integration() {
 				break;
 			},
 			Event::PaymentReceived { payment_id, amount_msat, .. } => {
-				assert_eq!(payment_id, Some(ordinary_receiver_payment_id));
+				assert_eq!(payment_id, ordinary_receiver_payment_id);
 				assert_eq!(amount_msat, ordinary_amount_msat);
 				client_node.event_handled().unwrap();
 			},
@@ -3854,9 +3854,9 @@ async fn bolt12_lsps2_client_service_integration() {
 		}
 	}
 	expect_channel_ready_event!(client_node, service_node.node_id());
-	expect_payment_successful_event!(payer_node, Some(restored_payment_id), None);
+	expect_payment_successful_event!(payer_node, restored_payment_id, None);
 	let restored_receiver_payment_id =
-		expect_payment_received_event!(client_node, fixed_received_msat).unwrap();
+		expect_payment_received_event!(client_node, fixed_received_msat);
 	match client_node.payment(&restored_receiver_payment_id).unwrap().kind {
 		PaymentKind::Bolt12Offer { counterparty_skimmed_fee_msat, .. } => {
 			assert_eq!(counterparty_skimmed_fee_msat, Some(fixed_fee_msat));
