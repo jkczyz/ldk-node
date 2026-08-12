@@ -5130,10 +5130,10 @@ async fn do_lsps2_multi_lsp_picks_cheapest(
 	expect_event!(cheap, PaymentForwarded);
 	expect_channel_pending_event!(client, cheap.node_id());
 	expect_channel_ready_event!(client, cheap.node_id());
-	expect_payment_successful_event!(payer, Some(payment_id), None);
+	expect_payment_successful_event!(payer, payment_id, None);
 	let fee_msat = payment_amount_msat * cheap_opening_fee_ppm as u64 / 1_000_000;
 	let receiver_payment_id =
-		expect_payment_received_event!(client, payment_amount_msat - fee_msat).unwrap();
+		expect_payment_received_event!(client, payment_amount_msat - fee_msat);
 	match client.payment(&receiver_payment_id).unwrap().kind {
 		PaymentKind::Bolt12Offer { counterparty_skimmed_fee_msat, .. } => {
 			assert_eq!(counterparty_skimmed_fee_msat, Some(fee_msat));
