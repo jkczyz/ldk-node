@@ -1370,6 +1370,7 @@ where
 							hash: Some(payment_hash),
 							preimage: payment_preimage,
 							secret: Some(payment_secret),
+							counterparty_skimmed_fee_msat: None,
 							offer_id: payment_context.offer_id,
 							payer_note: payment_context.invoice_request.payer_note_truncated,
 							quantity: payment_context.invoice_request.quantity,
