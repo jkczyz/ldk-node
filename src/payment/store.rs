@@ -1477,6 +1477,40 @@ mod tests {
 		assert_eq!(payment, PaymentDetails::read(&mut &*encoded).unwrap());
 	}
 
+	#[test]
+	fn inbound_bolt12_refunds_can_be_failed() {
+		// `EventHandler::fail_claimable_payment` applies exactly this update when refusing a
+		// claimable payment, e.g. when the counterparty withheld a fee from a payment carrying
+		// no LSPS2 metadata. Inbound `Bolt12Refund` records are created with their hash set by
+		// the `PaymentClaimable` handling, so failing one must not trip the outbound-only
+		// payment hash assertion. The equivalent `Bolt12Offer` assertion was relaxed to permit
+		// an unchanged hash; the `Bolt12Refund` arm still asserts on the direction.
+		let payment_id = PaymentId([41; 32]);
+		let hash = PaymentHash([42; 32]);
+		let mut payment = PaymentDetails::new(
+			payment_id,
+			PaymentKind::Bolt12Refund {
+				hash: Some(hash),
+				preimage: None,
+				secret: None,
+				payer_note: None,
+				quantity: None,
+			},
+			Some(100_000),
+			None,
+			PaymentDirection::Inbound,
+			PaymentStatus::Pending,
+		);
+
+		payment.update(PaymentDetailsUpdate {
+			hash: Some(Some(hash)),
+			status: Some(PaymentStatus::Failed),
+			..PaymentDetailsUpdate::new(payment_id)
+		});
+
+		assert_eq!(payment.status, PaymentStatus::Failed);
+	}
+
 	#[derive(Clone, Debug, PartialEq, Eq)]
 	struct LegacyBolt11JitKind {
 		hash: PaymentHash,
