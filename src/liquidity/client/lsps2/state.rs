@@ -706,6 +706,25 @@ mod tests {
 	}
 
 	#[test]
+	fn rejects_cltv_delta_that_overflows_bolt12_final_cltv_buffer() {
+		// The BOLT12 JIT router passes `MIN_FINAL_CLTV_EXPIRY_DELTA + 2` as the final CLTV
+		// delta, which LDK aggregates with the lease's own delta in `u16` arithmetic and fails
+		// path construction on overflow. That failure only surfaces after
+		// `prepare_invoice_response` has already consumed the lease, so any delta above
+		// `u16::MAX - (MIN_FINAL_CLTV_EXPIRY_DELTA + 2)` - while still within the `u16` range
+		// checked here - reproduces the consume-then-reject cycle that rejecting oversized
+		// deltas was meant to prevent. Such leases must already fail validation.
+		let mut lease =
+			lease(2, 54, 1, Some(1_000), now_secs() + MIN_CACHED_LEASE_REMAINING_SECS + 60);
+		lease.cltv_expiry_delta = u16::MAX as u32;
+
+		assert!(
+			!is_lease_usable(&lease),
+			"lease CLTV delta cannot absorb the BOLT12 final CLTV buffer"
+		);
+	}
+
+	#[test]
 	fn selects_cheapest_matching_lease_across_lsps() {
 		let valid_until = now_secs() + MIN_CACHED_LEASE_REMAINING_SECS + 60;
 		let expensive = lease(2, 44, 100, Some(1_000), valid_until);
