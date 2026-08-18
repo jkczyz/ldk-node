@@ -158,9 +158,9 @@ pub(crate) struct Wallet {
 	logger: Arc<Logger>,
 	pending_payment_store: Arc<PendingPaymentStore>,
 	// Serializes the writers that must observe the payment record and its pending-store entry
-	// (candidate history included) as one consistent unit: classification holds it across its
-	// two-store write pair, and wallet sync's event arms hold it from payment-id resolution
-	// through their last write. Without it, a confirmation landing between classification's two
+	// (candidate history included) as one consistent unit: classification and wallet sync's event
+	// arms each hold it from payment-id resolution through their last write (classification's
+	// being its two-store pair). Without it, a confirmation landing between classification's two
 	// writes sees the record classified but the candidate history absent — resolving the wrong
 	// payment id or stamping the confirmed candidate with another candidate's figures — and a
 	// classification landing inside an arm's decision sequence gets overwritten by the arm's
@@ -1594,7 +1594,15 @@ impl Wallet {
 			return Ok(());
 		}
 
-		let payment_id = PaymentId(txid.to_byte_array());
+		// Resolution and the writes below must share one lock acquisition: resolved outside it,
+		// the id could go stale against a record wallet sync creates for the same transaction,
+		// and the write below would mint a divergent record.
+		let guard = self.funding_payment_update_lock.lock().await;
+
+		// Adopt the id of a record that already tracks this transaction — e.g. a 0conf splice
+		// re-broadcast through LDK's generic funding path resolves back to its
+		// interactive-funding record here — otherwise mint a fresh id.
+		let payment_id = self.find_payment_by_txid(txid).unwrap_or_else(random_payment_id);
 
 		// A promoted-but-unconfirmed 0conf splice comes back through this generic path re-typed
 		// and carrying wallet-view figures; `funding_reclassification_update` declines the
@@ -1629,7 +1637,7 @@ impl Wallet {
 			direction,
 			PaymentStatus::Pending,
 		);
-		self.persist_funding_payment(details, Vec::new()).await?;
+		self.persist_funding_payment_locked(&guard, details, Vec::new()).await?;
 		log_debug!(
 			self.logger,
 			"Recorded channel-funding broadcast {} for channel {}",
@@ -1649,10 +1657,6 @@ impl Wallet {
 		// `InteractiveFunding` carries the full negotiated history; the currently-broadcast
 		// candidate is the last entry, earlier entries are RBF predecessors.
 		let active = match candidates.last() {
-			Some(c) => c,
-			None => return Ok(()),
-		};
-		let first = match candidates.first() {
 			Some(c) => c,
 			None => return Ok(()),
 		};
@@ -1689,9 +1693,20 @@ impl Wallet {
 			return Ok(());
 		}
 
-		// Anchor the `PaymentId` to the first negotiated candidate so the record stays stable
-		// across RBF replacements.
-		let payment_id = PaymentId(first.txid.to_byte_array());
+		// Resolution and the writes below must share one lock acquisition: resolved outside it,
+		// the id could go stale against a record wallet sync creates for the same transaction,
+		// and the write below would mint a divergent record.
+		let guard = self.funding_payment_update_lock.lock().await;
+
+		// Adopt the id of a record that already tracks any negotiated round (wallet sync may
+		// record a round before this classification runs); otherwise mint a fresh id. An id
+		// derived from a txid would tie the record's identity to one round of a replaceable
+		// transaction — resolution through the record's txid history is what keeps its identity
+		// stable across RBF replacements.
+		let payment_id = candidates
+			.iter()
+			.find_map(|candidate| self.find_payment_by_txid(candidate.txid))
+			.unwrap_or_else(random_payment_id);
 
 		// Record every candidate's figures (`None` for any round we didn't contribute to, e.g. a
 		// counterparty-initiated splice our `splice_in` later joined via RBF) so the confirmed
@@ -1721,7 +1736,7 @@ impl Wallet {
 			direction,
 			PaymentStatus::Pending,
 		);
-		self.persist_funding_payment(details, candidate_records).await?;
+		self.persist_funding_payment_locked(&guard, details, candidate_records).await?;
 		log_debug!(
 			self.logger,
 			"Recorded interactive-funding broadcast {} ({} candidates, {} channels)",
@@ -1768,13 +1783,30 @@ impl Wallet {
 
 	/// Writes a freshly-classified funding payment to the authoritative payment store and adds a
 	/// pending-store index entry, so wallet sync graduates it through `ANTI_REORG_DELAY`.
+	///
+	/// Production callers go through [`Self::persist_funding_payment_locked`] because they resolve
+	/// the record's id under the same lock acquisition; this wrapper models that acquisition for
+	/// tests entering classification mid-flow.
+	#[cfg(test)]
 	async fn persist_funding_payment(
 		&self, details: PaymentDetails, candidates: Vec<FundingTxCandidate>,
 	) -> Result<(), Error> {
 		// Hold the cross-store lock across both writes so a funding confirmation never observes
 		// the record classified but the candidate history it needs still missing.
-		let _guard = self.funding_payment_update_lock.lock().await;
+		let guard = self.funding_payment_update_lock.lock().await;
+		self.persist_funding_payment_locked(&guard, details, candidates).await
+	}
 
+	/// Writes a freshly-classified funding payment to the authoritative payment store and adds a
+	/// pending-store index entry, so wallet sync graduates it through `ANTI_REORG_DELAY`. The
+	/// caller holds the cross-store lock, resolving the record's id and performing both store
+	/// writes under one acquisition, so a funding confirmation never observes the record
+	/// classified but the candidate history it needs still missing, and the resolved id never
+	/// goes stale against a concurrent sync write.
+	async fn persist_funding_payment_locked(
+		&self, _guard: &tokio::sync::MutexGuard<'_, ()>, details: PaymentDetails,
+		candidates: Vec<FundingTxCandidate>,
+	) -> Result<(), Error> {
 		// Everything this write does depends on the record's current state, so all of it must be
 		// decided inside the store's critical section. When a record exists — no matter when it
 		// appeared — only the classification (`tx_type`) and the figures of whichever candidate
@@ -1939,7 +1971,17 @@ impl Wallet {
 			return Some(replaced_details.details.id);
 		}
 
-		None
+		// The pending store only indexes in-flight records — graduation removes the entry — so a
+		// graduated record's transaction resolves through the payment store itself. Without this,
+		// a funding-typed broadcast classified after graduation (e.g. LDK re-offering a promoted
+		// 0conf splice whose confirmation landed while the node was offline) would mint a
+		// duplicate record, and a post-graduation reorg's events would never reach the record.
+		self.payment_store
+			.list_filter(
+				|p| matches!(p.kind, PaymentKind::Onchain { txid, .. } if txid == target_txid),
+			)
+			.first()
+			.map(|p| p.id)
 	}
 
 	/// If `payment_id` refers to a classified funding payment, refreshes its confirmation status
@@ -2336,6 +2378,15 @@ fn aggregate_local_stakes(candidate: &FundingCandidate) -> LocalStakeAggregate {
 	}
 }
 
+/// Mints a fresh funding-record [`PaymentId`] from the OS entropy source. A funding record's id
+/// carries no meaning beyond uniqueness: the record is found through its transaction history
+/// ([`Wallet::find_payment_by_txid`]), never re-derived from a txid.
+fn random_payment_id() -> PaymentId {
+	let mut bytes = [0u8; 32];
+	getrandom::fill(&mut bytes).expect("getrandom failed");
+	PaymentId(bytes)
+}
+
 /// The outcome of [`Wallet::apply_funding_status_update_locked`].
 enum FundingStatusUpdate {
 	/// The event's transaction belongs to the funding payment; its refreshed confirmation status
@@ -2677,7 +2728,7 @@ fn ldk_to_bdk_satisfaction_weight(ldk_satisfaction_weight: u64) -> Weight {
 /// classification.
 ///
 /// `current` is the record as observed inside the payment store's `mutate` critical section — its
-/// sole caller, [`Wallet::persist_funding_payment`], builds and applies the update within one
+/// sole caller, [`Wallet::persist_funding_payment_locked`], builds and applies the update within one
 /// closure — so the candidate choice cannot go stale against a concurrent confirmation before the
 /// update lands. [`PaymentDetails::update`]'s confirmed-figures rule still arbitrates which
 /// figures may land on the record.
@@ -3981,6 +4032,31 @@ mod tests {
 		assert_eq!(wallet.find_payment_by_txid(txid2), Some(payment_id));
 	}
 
+	/// A graduated funding record has no pending entry — graduation removes it — so its txid must
+	/// resolve through the payment store itself. Without that fallback, a funding-typed broadcast
+	/// classified after graduation (e.g. LDK re-offering a promoted 0conf splice whose
+	/// confirmation landed while the node was offline) would miss the record and mint a duplicate
+	/// under a fresh id.
+	#[tokio::test]
+	async fn find_payment_by_txid_resolves_graduated_records() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+
+		let txid = Txid::from_byte_array([6u8; 32]);
+		let payment_id = PaymentId([21u8; 32]);
+		let mut graduated =
+			interactive_funding_details(payment_id, txid, Some(1_000_000), Some(500));
+		graduated.kind = PaymentKind::Onchain {
+			txid,
+			status: confirmed_status(),
+			tx_type: Some(TransactionType::InteractiveFunding { channels: vec![] }),
+		};
+		graduated.status = PaymentStatus::Succeeded;
+		wallet.payment_store.insert_or_update(graduated).await.unwrap();
+
+		assert_eq!(wallet.find_payment_by_txid(txid), Some(payment_id));
+	}
+
 	/// A cooperative close conflicts with a pending splice's funding transaction — both spend the
 	/// pre-splice funding outpoint — so sync records the close among the splice record's
 	/// conflicting txids, and the close's confirmation then resolves to the splice's PaymentId.
@@ -4130,7 +4206,112 @@ mod tests {
 		wallet.classify_funding(&funded_tx, &channels, tx_type).await.unwrap();
 		let payments = wallet.payment_store.list_filter(|_| true);
 		assert_eq!(payments.len(), 1);
-		assert_eq!(payments[0].id, PaymentId(funded_tx.compute_txid().to_byte_array()));
+		match &payments[0].kind {
+			PaymentKind::Onchain { txid, .. } => assert_eq!(*txid, funded_tx.compute_txid()),
+			kind => panic!("unexpected kind {:?}", kind),
+		}
+	}
+
+	/// A funding record's PaymentId is minted at record creation instead of being derived from a
+	/// txid: a replaceable transaction's txid is no stable identity for the record. Every lookup
+	/// resolves the record through its txid history (current txid, candidates, conflicts) rather
+	/// than re-deriving the id, so nothing may rely on the id and the txid coinciding.
+	#[tokio::test]
+	async fn funding_record_is_keyed_by_a_generated_id() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+
+		let counterparty_node_id = PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.unwrap();
+		let channels = vec![(counterparty_node_id, ChannelId([7u8; 32]))];
+		let tx_type = TransactionType::Funding { channels: vec![] };
+
+		let script_pubkey = wallet
+			.inner
+			.lock()
+			.unwrap()
+			.reveal_next_address(KeychainKind::External)
+			.address
+			.script_pubkey();
+		let funded_tx = Transaction {
+			version: bitcoin::transaction::Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: Vec::new(),
+			output: vec![TxOut { value: Amount::from_sat(10_000), script_pubkey }],
+		};
+		let txid = funded_tx.compute_txid();
+		wallet.classify_funding(&funded_tx, &channels, tx_type).await.unwrap();
+
+		let payments = wallet.payment_store.list_filter(|_| true);
+		assert_eq!(payments.len(), 1);
+		let record = &payments[0];
+		assert_ne!(record.id, PaymentId(txid.to_byte_array()), "the id must not be the txid");
+		match &record.kind {
+			PaymentKind::Onchain { txid: kind_txid, .. } => assert_eq!(*kind_txid, txid),
+			kind => panic!("unexpected kind {:?}", kind),
+		}
+		// The pending entry shares the id, and txid lookups resolve to the record.
+		assert!(wallet.pending_payment_store.get(&record.id).is_some());
+		assert_eq!(wallet.find_payment_by_txid(txid), Some(record.id));
+	}
+
+	/// A funding transaction classified again — e.g. a 0conf splice re-offered through LDK's
+	/// generic funding path after a restart — must resolve to the record's generated id rather
+	/// than mint a second record for the same transaction.
+	#[tokio::test]
+	async fn funding_rebroadcast_resolves_to_the_generated_id() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+
+		let counterparty_node_id = PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.unwrap();
+		let channels = vec![(counterparty_node_id, ChannelId([7u8; 32]))];
+
+		let script_pubkey = wallet
+			.inner
+			.lock()
+			.unwrap()
+			.reveal_next_address(KeychainKind::External)
+			.address
+			.script_pubkey();
+		let funded_tx = Transaction {
+			version: bitcoin::transaction::Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: Vec::new(),
+			output: vec![TxOut { value: Amount::from_sat(10_000), script_pubkey }],
+		};
+		let txid = funded_tx.compute_txid();
+
+		// The record the interactive-funding classification created, keyed by a generated id.
+		let payment_id = PaymentId([42u8; 32]);
+		let candidates = vec![FundingTxCandidate {
+			txid,
+			amount_msat: Some(1_000_000),
+			fee_paid_msat: Some(500),
+		}];
+		let details = interactive_funding_details(payment_id, txid, Some(1_000_000), Some(500));
+		wallet.persist_funding_payment(details, candidates).await.unwrap();
+
+		// The re-typed rebroadcast comes back through the generic funding path.
+		wallet
+			.classify_funding(&funded_tx, &channels, TransactionType::Funding { channels: vec![] })
+			.await
+			.unwrap();
+
+		let payments = wallet.payment_store.list_filter(|_| true);
+		assert_eq!(payments.len(), 1, "the rebroadcast must not mint a second record");
+		assert_eq!(payments[0].id, payment_id);
+		// The interactive classification and contribution figures survive the generic
+		// wallet-view update (`funding_reclassification_update` declines the downgrade).
+		assert!(matches!(
+			payments[0].kind,
+			PaymentKind::Onchain { tx_type: Some(TransactionType::InteractiveFunding { .. }), .. }
+		));
+		assert_eq!(payments[0].amount_msat, Some(1_000_000));
 	}
 
 	/// LDK re-broadcasts a promoted-but-unconfirmed 0conf splice through its generic funding
