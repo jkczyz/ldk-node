@@ -83,6 +83,7 @@
 mod balance;
 mod builder;
 mod chain;
+mod channel;
 pub mod config;
 mod connection;
 mod data_store;
@@ -128,6 +129,7 @@ pub use builder::BuildError;
 #[cfg(not(feature = "uniffi"))]
 pub use builder::NodeBuilder as Builder;
 use chain::ChainSource;
+use channel::SpliceRetrier;
 use config::{
 	default_user_config, may_announce_channel, AsyncPaymentsRole, ChannelConfig, Config,
 	LNURL_AUTH_TIMEOUT_SECS, NODE_ANN_BCAST_INTERVAL, PEER_RECONNECTION_INTERVAL,
@@ -171,6 +173,7 @@ use lnurl_auth::LnurlAuth;
 use logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use payment::asynchronous::static_invoice_store::StaticInvoiceStore;
+use payment::pending_payment_store::SpliceKind;
 use payment::{
 	Bolt11Payment, Bolt12Payment, OnchainPayment, PaymentDetails, SpontaneousPayment,
 	UnifiedPayment,
@@ -265,6 +268,7 @@ pub struct Node {
 	scorer: Arc<Mutex<Scorer>>,
 	peer_store: Arc<PeerStore<Arc<Logger>>>,
 	payment_store: Arc<PaymentStore>,
+	splice_retrier: Arc<SpliceRetrier>,
 	lnurl_auth: Arc<LnurlAuth>,
 	is_running: Arc<RwLock<bool>>,
 	node_metrics: Arc<PersistedNodeMetrics>,
@@ -677,6 +681,7 @@ impl Node {
 			Arc::clone(&self.onion_messenger),
 			self.om_mailbox.clone(),
 			self.prober.clone(),
+			Arc::clone(&self.splice_retrier),
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
@@ -1773,12 +1778,18 @@ impl Node {
 					Error::ChannelSplicingFailed
 				})?;
 
-			self.channel_manager
-				.funding_contributed(
-					&channel_details.channel_id,
-					&counterparty_node_id,
+			let pre_splice_funding_txo = channel_details.funding_txo.ok_or_else(|| {
+				log_error!(self.logger, "Failed to splice channel: channel not yet ready");
+				Error::ChannelSplicingFailed
+			})?;
+			self.splice_retrier
+				.submit(
+					*user_channel_id,
+					counterparty_node_id,
+					channel_details.channel_id,
+					pre_splice_funding_txo.into_bitcoin_outpoint(),
 					contribution,
-					None,
+					SpliceKind::In { amount_sats: splice_amount_sats },
 				)
 				.map_err(|e| {
 					log_error!(self.logger, "Failed to splice channel: {:?}", e);
@@ -1800,6 +1811,12 @@ impl Node {
 	/// This provides for increasing a channel's outbound liquidity without re-balancing or closing
 	/// it. Once negotiation with the counterparty is complete, the channel remains operational
 	/// while waiting for a new funding transaction to confirm.
+	///
+	/// A recoverable failure (e.g. the peer disconnecting mid-negotiation) is retried
+	/// automatically while the node runs; [`Event::SpliceNegotiationFailed`] is emitted only once
+	/// the splice is given up on. A failure never handled while running is replayed by LDK after
+	/// a restart and its splice is resubmitted; only a splice whose negotiation failed without
+	/// LDK recording anything is dropped on restart.
 	///
 	/// # Experimental API
 	///
@@ -1825,6 +1842,12 @@ impl Node {
 	/// it. Once negotiation with the counterparty is complete, the channel remains operational
 	/// while waiting for a new funding transaction to confirm.
 	///
+	/// A recoverable failure (e.g. the peer disconnecting mid-negotiation) is retried
+	/// automatically while the node runs; [`Event::SpliceNegotiationFailed`] is emitted only once
+	/// the splice is given up on. A failure never handled while running is replayed by LDK after
+	/// a restart and its splice is resubmitted; only a splice whose negotiation failed without
+	/// LDK recording anything is dropped on restart.
+	///
 	/// # Experimental API
 	///
 	/// This API is experimental. Currently, a splice-in will be marked as an outbound payment, but
@@ -1840,6 +1863,12 @@ impl Node {
 	/// This provides for decreasing a channel's outbound liquidity without re-balancing or closing
 	/// it. Once negotiation with the counterparty is complete, the channel remains operational
 	/// while waiting for a new funding transaction to confirm.
+	///
+	/// A recoverable failure (e.g. the peer disconnecting mid-negotiation) is retried
+	/// automatically while the node runs; [`Event::SpliceNegotiationFailed`] is emitted only once
+	/// the splice is given up on. A failure never handled while running is replayed by LDK after
+	/// a restart and its splice is resubmitted; only a splice whose negotiation failed without
+	/// LDK recording anything is dropped on restart.
 	///
 	/// # Experimental API
 	///
@@ -1897,18 +1926,25 @@ impl Node {
 				value: Amount::from_sat(splice_amount_sats),
 				script_pubkey: address.script_pubkey(),
 			}];
-			let contribution =
-				funding_template.splice_out(outputs, feerate, max_feerate).map_err(|e| {
-					log_error!(self.logger, "Failed to splice channel: {}", e);
-					Error::ChannelSplicingFailed
-				})?;
+			let contribution = funding_template
+				.splice_out(outputs.clone(), feerate, max_feerate)
+				.map_err(|e| {
+				log_error!(self.logger, "Failed to splice channel: {}", e);
+				Error::ChannelSplicingFailed
+			})?;
 
-			self.channel_manager
-				.funding_contributed(
-					&channel_details.channel_id,
-					&counterparty_node_id,
+			let pre_splice_funding_txo = channel_details.funding_txo.ok_or_else(|| {
+				log_error!(self.logger, "Failed to splice channel: channel not yet ready");
+				Error::ChannelSplicingFailed
+			})?;
+			self.splice_retrier
+				.submit(
+					*user_channel_id,
+					counterparty_node_id,
+					channel_details.channel_id,
+					pre_splice_funding_txo.into_bitcoin_outpoint(),
 					contribution,
-					None,
+					SpliceKind::Out { outputs },
 				)
 				.map_err(|e| {
 					log_error!(self.logger, "Failed to splice channel: {:?}", e);
@@ -1928,6 +1964,12 @@ impl Node {
 	/// Fee-bumps the pending splice on a channel by replacing its in-flight funding transaction
 	/// (RBF). The splice's amount and destination are preserved; only the fee rate is raised.
 	/// Errors if the channel has no pending splice to bump.
+	///
+	/// A recoverable failure (e.g. the peer disconnecting mid-negotiation) is retried
+	/// automatically while the node runs; [`Event::SpliceNegotiationFailed`] is emitted only once
+	/// the fee bump is given up on. A failure never handled while running is replayed by LDK
+	/// after a restart and its fee bump is resubmitted; only a fee bump whose negotiation failed
+	/// without LDK recording anything is dropped on restart.
 	pub fn bump_channel_funding_fee(
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
 	) -> Result<(), Error> {
@@ -1974,12 +2016,18 @@ impl Node {
 					Error::ChannelSplicingFailed
 				})?;
 
-			self.channel_manager
-				.funding_contributed(
-					&channel_details.channel_id,
-					&counterparty_node_id,
+			let pre_splice_funding_txo = channel_details.funding_txo.ok_or_else(|| {
+				log_error!(self.logger, "Failed to RBF channel: channel not yet ready");
+				Error::ChannelSplicingFailed
+			})?;
+			self.splice_retrier
+				.submit(
+					*user_channel_id,
+					counterparty_node_id,
+					channel_details.channel_id,
+					pre_splice_funding_txo.into_bitcoin_outpoint(),
 					contribution,
-					None,
+					SpliceKind::Rbf {},
 				)
 				.map_err(|e| {
 					log_error!(self.logger, "Failed to RBF channel: {:?}", e);

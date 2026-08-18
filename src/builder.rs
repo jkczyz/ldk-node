@@ -46,6 +46,7 @@ use lightning_dns_resolver::OMDomainResolver;
 use vss_client::headers::VssHeaderProvider;
 
 use crate::chain::ChainSource;
+use crate::channel::SpliceRetrier;
 use crate::config::{
 	default_user_config, may_announce_channel, AnnounceError, AsyncPaymentsRole,
 	BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig, HRNResolverConfig,
@@ -2336,6 +2337,13 @@ fn build_with_store_internal(
 		})
 	});
 
+	let splice_retrier = Arc::new(SpliceRetrier::new(
+		Arc::clone(&channel_manager),
+		Arc::clone(&wallet),
+		Arc::clone(&fee_estimator),
+		Arc::clone(&logger),
+	));
+
 	#[cfg(cycle_tests)]
 	let mut _leak_checker = crate::LeakChecker(Vec::new());
 	#[cfg(cycle_tests)]
@@ -2375,6 +2383,7 @@ fn build_with_store_internal(
 		scorer,
 		peer_store,
 		payment_store,
+		splice_retrier,
 		lnurl_auth,
 		is_running,
 		node_metrics,

@@ -882,6 +882,30 @@ impl Wallet {
 		}
 	}
 
+	/// Re-reserves the wallet-owned addresses paid by `outputs`, undoing the release performed by
+	/// [`Self::cancel_tx`] for a transaction that is being resubmitted rather than abandoned.
+	/// Outputs paying scripts the wallet does not own are ignored.
+	pub(crate) async fn reserve_tx_outputs(&self, outputs: &[TxOut]) -> Result<(), Error> {
+		let mut locked_persister = self.persister.lock().await;
+		let change_set = {
+			let mut locked_wallet = self.inner.lock().expect("lock");
+			for txout in outputs {
+				if let Some((keychain, index)) =
+					locked_wallet.derivation_of_spk(txout.script_pubkey.clone())
+				{
+					locked_wallet.mark_used(keychain, index);
+				}
+			}
+			locked_wallet.take_staged().unwrap_or_default()
+		};
+		locked_persister.persist_changeset(change_set).await.map_err(|e| {
+			log_error!(self.logger, "Failed to persist wallet: {}", e);
+			Error::PersistenceFailed
+		})?;
+
+		Ok(())
+	}
+
 	pub(crate) fn get_balances(
 		&self, total_anchor_channels_reserve_sats: u64,
 	) -> Result<(u64, u64), Error> {
@@ -3097,6 +3121,31 @@ mod tests {
 
 	fn pooled_indices(wallet: &Wallet) -> Vec<u32> {
 		wallet.address_pool.lock().unwrap().available.iter().map(|(index, _)| *index).collect()
+	}
+
+	#[tokio::test]
+	async fn reserving_outputs_re_marks_a_canceled_change_address() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		let address = wallet.get_new_internal_address().await.unwrap();
+		let txout =
+			TxOut { value: Amount::from_sat(1_000), script_pubkey: address.script_pubkey() };
+		let tx = Transaction {
+			version: bitcoin::transaction::Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: Vec::new(),
+			output: vec![txout.clone()],
+		};
+
+		// Canceling a transaction paying the address releases it back into the unused pool...
+		wallet.cancel_tx(tx.clone()).await.unwrap();
+		assert_eq!(wallet.get_new_internal_address().await.unwrap(), address);
+
+		// ...and re-reserving its outputs takes it back out.
+		wallet.cancel_tx(tx).await.unwrap();
+		wallet.reserve_tx_outputs(&[txout]).await.unwrap();
+		assert_ne!(wallet.get_new_internal_address().await.unwrap(), address);
 	}
 
 	#[tokio::test]

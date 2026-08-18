@@ -353,15 +353,36 @@ pub(crate) fn test_funding_contribution() -> FundingContribution {
 /// Like [`test_funding_contribution`], but with the given input-selection feerate in sat/kwu.
 #[cfg(test)]
 pub(crate) fn test_funding_contribution_with_feerate(feerate: u64) -> FundingContribution {
-	let mut tlv_bytes = vec![
-		33u8, // BigSize length prefix over the TLV records below
+	test_funding_contribution_with_outputs(feerate, &[])
+}
+
+/// Like [`test_funding_contribution_with_feerate`], but also carrying the given splice-out
+/// `outputs`.
+#[cfg(test)]
+pub(crate) fn test_funding_contribution_with_outputs(
+	feerate: u64, outputs: &[bitcoin::TxOut],
+) -> FundingContribution {
+	use lightning::util::ser::Writeable;
+	let mut records = vec![
 		1, 8, 0, 0, 0, 0, 0, 0, 0, 0, // (1, estimated_fee: 0 sat)
-		9, 8, // (9, feerate)
 	];
-	tlv_bytes.extend_from_slice(&feerate.to_be_bytes());
-	tlv_bytes.extend_from_slice(&[11, 8]); // (11, max_feerate)
-	tlv_bytes.extend_from_slice(&feerate.to_be_bytes());
-	tlv_bytes.extend_from_slice(&[13, 1, 1]); // (13, is_splice: true)
+	if !outputs.is_empty() {
+		let mut output_bytes = Vec::new();
+		for output in outputs {
+			output.write(&mut output_bytes).expect("in-memory write must succeed");
+		}
+		records.push(5); // (5, outputs)
+		records.push(u8::try_from(output_bytes.len()).expect("test outputs must stay small"));
+		records.extend_from_slice(&output_bytes);
+	}
+	records.extend_from_slice(&[9, 8]); // (9, feerate)
+	records.extend_from_slice(&feerate.to_be_bytes());
+	records.extend_from_slice(&[11, 8]); // (11, max_feerate)
+	records.extend_from_slice(&feerate.to_be_bytes());
+	records.extend_from_slice(&[13, 1, 1]); // (13, is_splice: true)
+										 // BigSize length prefix over the TLV records above; single-byte as long as they stay short.
+	let mut tlv_bytes = vec![u8::try_from(records.len()).expect("test TLV stream must stay small")];
+	tlv_bytes.extend(records);
 	lightning::util::ser::Readable::read(&mut &tlv_bytes[..])
 		.expect("hand-built TLV stream must decode")
 }
