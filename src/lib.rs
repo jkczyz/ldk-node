@@ -1933,9 +1933,9 @@ impl Node {
 	/// it. Once negotiation with the counterparty is complete, the channel remains operational
 	/// while waiting for a new funding transaction to confirm.
 	///
-	/// If the node restarts before the splice completes, it is resubmitted automatically until it
-	/// either completes or is given up on, at which point [`Event::SpliceNegotiationFailed`] is
-	/// emitted. If this method returns an error, the splice is abandoned; however, if the
+	/// The splice is retried automatically, including across restarts, until it either completes or
+	/// fails for a reason retrying cannot address, at which point [`Event::SpliceNegotiationFailed`]
+	/// is emitted. If this method returns an error, the splice is abandoned; however, if the
 	/// abandonment cannot be persisted, the splice may still be retried after a restart.
 	///
 	/// # Experimental API
@@ -1962,9 +1962,9 @@ impl Node {
 	/// it. Once negotiation with the counterparty is complete, the channel remains operational
 	/// while waiting for a new funding transaction to confirm.
 	///
-	/// If the node restarts before the splice completes, it is resubmitted automatically until it
-	/// either completes or is given up on, at which point [`Event::SpliceNegotiationFailed`] is
-	/// emitted. If this method returns an error, the splice is abandoned; however, if the
+	/// The splice is retried automatically, including across restarts, until it either completes or
+	/// fails for a reason retrying cannot address, at which point [`Event::SpliceNegotiationFailed`]
+	/// is emitted. If this method returns an error, the splice is abandoned; however, if the
 	/// abandonment cannot be persisted, the splice may still be retried after a restart.
 	///
 	/// # Experimental API
@@ -1983,9 +1983,9 @@ impl Node {
 	/// it. Once negotiation with the counterparty is complete, the channel remains operational
 	/// while waiting for a new funding transaction to confirm.
 	///
-	/// If the node restarts before the splice completes, it is resubmitted automatically until it
-	/// either completes or is given up on, at which point [`Event::SpliceNegotiationFailed`] is
-	/// emitted. If this method returns an error, the splice is abandoned; however, if the
+	/// The splice is retried automatically, including across restarts, until it either completes or
+	/// fails for a reason retrying cannot address, at which point [`Event::SpliceNegotiationFailed`]
+	/// is emitted. If this method returns an error, the splice is abandoned; however, if the
 	/// abandonment cannot be persisted, the splice may still be retried after a restart.
 	///
 	/// # Experimental API
@@ -2086,10 +2086,11 @@ impl Node {
 	/// (RBF). The splice's amount and destination are preserved; only the fee rate is raised.
 	/// Errors if the channel has no pending splice to bump.
 	///
-	/// If the node restarts before the fee bump completes, it is resubmitted automatically until
-	/// it either completes or is given up on, at which point [`Event::SpliceNegotiationFailed`]
-	/// is emitted. If this method returns an error, the fee bump is abandoned; however, if the
-	/// abandonment cannot be persisted, the fee bump may still be retried after a restart.
+	/// The fee bump is retried automatically, including across restarts, until it either completes
+	/// or fails for a reason retrying cannot address, at which point
+	/// [`Event::SpliceNegotiationFailed`] is emitted. If this method returns an error, the fee bump
+	/// is abandoned; however, if the abandonment cannot be persisted, the fee bump may still be
+	/// retried after a restart.
 	pub fn bump_channel_funding_fee(
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
 	) -> Result<(), Error> {
