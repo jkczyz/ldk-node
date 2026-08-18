@@ -19,7 +19,8 @@ use bitcoin::hashes::sha256::Hash as Sha256Hash;
 use bitcoin::hashes::Hash;
 use bitcoin::{Address, Amount, ScriptBuf, Txid};
 use common::logging::{
-	init_log_logger, validate_log_entry, CollectingLogWriter, MultiNodeLogger, TestLogWriter,
+	init_log_logger, validate_log_entry, CollectingLogWriter, MarkerLogWriter, MultiNodeLogger,
+	TestLogWriter,
 };
 use common::{
 	bump_fee_and_broadcast, distribute_funds_unconfirmed, do_channel_full_cycle,
@@ -2740,6 +2741,106 @@ async fn splice_in_rbf_joins_counterparty_splice() {
 	let rbf_txo = expect_splice_negotiated_event!(node_a, node_b.node_id());
 	expect_splice_negotiated_event!(node_b, node_a.node_id());
 	assert_ne!(counterparty_txo, rbf_txo, "node_a's RBF should produce a different funding txo");
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+}
+
+/// A recoverable mid-negotiation failure is retried without surfacing to the user: the initiator
+/// disconnects while the interactive negotiation is in flight, LDK fails the splice with
+/// `PeerDisconnected`, and the retrier resubmits the same contribution once reconnected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn splice_retried_after_disconnect_mid_negotiation() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+
+	// The retry leaves no trace in the stores; observe it through Node A's logs. The negotiation is
+	// synchronized through a marker: LDK's peer handler logs every received message, and the
+	// counterparty's `splice_ack` is the earliest point where a disconnect fails the splice — any
+	// sooner and the contribution is still queued, which LDK resumes on reconnect by itself.
+	let logger_a = Arc::new(CollectingLogWriter::new());
+	let splice_ack_seen = Arc::new(tokio::sync::Notify::new());
+	let mut config_a = random_config();
+	config_a.log_writer = TestLogWriter::Custom(Arc::new(MarkerLogWriter::new(
+		logger_a.clone(),
+		"Received message SpliceAck",
+		splice_ack_seen.clone(),
+	)));
+	// `Node::disconnect` persists a peer-store removal before severing the connection, and the
+	// negotiation keeps running during that write. The default composite test store turns it into
+	// several fsyncs plus a cross-store comparison, wide enough to lose the race below; a plain
+	// SQLite store keeps it to a single quick write.
+	config_a.store_type = TestStoreType::Sqlite;
+	let node_a = setup_node(&chain_source, config_a);
+	let node_b = setup_node(&chain_source, random_config());
+
+	// Fund Node A with many small UTXOs: every input the splice contributes adds an interactive-tx
+	// round trip, stretching the negotiation so the disconnect below reliably lands inside it.
+	let addresses_a: Vec<Address> =
+		(0..40).map(|_| node_a.onchain_payment().new_address().unwrap()).collect();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		addresses_a,
+		Amount::from_sat(125_000),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+
+	open_channel(&node_a, &node_b, 1_000_000, false, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	let user_channel_id_a = expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+
+	// The 3M target forces roughly 25 of the 125k-sat UTXOs into the contribution.
+	node_a.splice_in(&user_channel_id_a, node_b.node_id(), 3_000_000).unwrap();
+
+	// Disconnect as soon as the negotiation is in flight. The negotiation keeps running while the
+	// disconnect is processed, so in principle it could still complete first — the disconnect
+	// would then fail nothing and the resubmission assert below would trip. The ~25 remaining
+	// per-input round trips make that window practically unlosable; if this ever flakes, widen
+	// the contribution further.
+	tokio::time::timeout(std::time::Duration::from_secs(10), splice_ack_seen.notified())
+		.await
+		.expect("node A never received splice_ack");
+	node_a.disconnect(node_b.node_id()).unwrap();
+
+	// ... which fails it with `PeerDisconnected` — recoverable, so the retrier resubmits the
+	// contribution instead of surfacing the failure. LDK queues the resubmission until reconnect.
+	assert!(
+		logger_a.wait_for("Resubmitting splice for channel").await,
+		"the failed splice was not resubmitted"
+	);
+
+	let node_addr_b = node_b.listening_addresses().unwrap().first().unwrap().clone();
+	node_a.connect(node_b.node_id(), node_addr_b, false).unwrap();
+
+	// The resubmitted splice completes; had the failure surfaced instead, this would pop
+	// `SpliceNegotiationFailed` and panic.
+	let txo = expect_splice_negotiated_event!(node_a, node_b.node_id());
+
+	wait_for_classified_funding_payment(&node_a, txo.txid).await;
+	wait_for_tx(&electrsd.client, txo.txid).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+
+	let payment = funding_payment(&node_a, txo.txid);
+	assert_eq!(payment.status, PaymentStatus::Succeeded);
+	assert!(matches!(
+		payment.kind,
+		PaymentKind::Onchain {
+			status: ConfirmationStatus::Confirmed { .. },
+			tx_type: Some(TransactionType::InteractiveFunding { .. }),
+			..
+		}
+	));
 
 	node_a.stop().unwrap();
 	node_b.stop().unwrap();
