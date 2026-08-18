@@ -1827,6 +1827,7 @@ impl Wallet {
 		&self, _guard: &tokio::sync::MutexGuard<'_, ()>, details: PaymentDetails,
 		candidates: Vec<FundingTxCandidate>,
 	) -> Result<(), Error> {
+		let absorb_candidates = candidates.clone();
 		// Everything this write does depends on the record's current state, so all of it must be
 		// decided inside the store's critical section. When a record exists — no matter when it
 		// appeared — only the classification (`tx_type`) and the figures of whichever candidate
@@ -1923,6 +1924,70 @@ impl Wallet {
 				}
 			})
 			.await?;
+
+		// With the candidate history recorded, duplicates wallet sync minted for rounds that were
+		// not yet candidates can be folded back into this record. Runs after both writes so the
+		// funding-status gate accepts the candidates it adopts, and under the same lock
+		// acquisition, so sync cannot interleave; a failure surfaces to the broadcast queue's
+		// classification retry, which re-runs this idempotently.
+		self.absorb_stray_candidate_records(_guard, id, &absorb_candidates).await?;
+		Ok(())
+	}
+
+	/// Absorbs stray records wallet sync minted for this funding payment's candidates before
+	/// they were classified. Sync re-keys an event for a round it cannot attribute to the
+	/// funding record — not yet a candidate, so the funding-status gate reports it foreign — to
+	/// the round's txid-derived id, minting an untyped duplicate whose pending entry then
+	/// shadows the funding record in [`Self::find_payment_by_txid`]'s direct probe. Once the
+	/// round is a recorded candidate, the duplicate's confirmation (if any) belongs on the
+	/// funding record: adopt it, then remove the stray and its pending entry.
+	///
+	/// The caller must hold [`Self::funding_payment_update_lock`], per
+	/// [`Self::apply_funding_status_update_locked`]'s contract.
+	async fn absorb_stray_candidate_records(
+		&self, guard: &tokio::sync::MutexGuard<'_, ()>, id: PaymentId,
+		candidates: &[FundingTxCandidate],
+	) -> Result<(), Error> {
+		for candidate in candidates {
+			let stray_id = PaymentId(candidate.txid.to_byte_array());
+			if stray_id == id {
+				continue;
+			}
+			let stray = match self.payment_store.get(&stray_id) {
+				Some(stray) => stray,
+				None => continue,
+			};
+			// Only a duplicate view of this candidate's transaction qualifies: an untyped record
+			// wallet sync minted, or one a funding-typed rebroadcast classified onto it. Anything
+			// else keyed by the txid-derived id is left alone.
+			let status = match &stray.kind {
+				PaymentKind::Onchain {
+					txid,
+					status,
+					tx_type: None | Some(TransactionType::Funding { .. }),
+				} if *txid == candidate.txid => status.clone(),
+				_ => continue,
+			};
+			// Only a confirmation is worth adopting; an unconfirmed stray carries nothing the
+			// record needs — the actively-broadcast candidate stays the record's current txid.
+			if matches!(status, ConfirmationStatus::Confirmed { .. }) {
+				let outcome = self
+					.apply_funding_status_update_locked(guard, id, candidate.txid, status)
+					.await?;
+				debug_assert!(matches!(outcome, FundingStatusUpdate::Applied));
+				if !matches!(outcome, FundingStatusUpdate::Applied) {
+					// Adoption declined; keep the stray rather than discard its confirmation.
+					continue;
+				}
+			}
+			log_debug!(
+				self.logger,
+				"Absorbing stray payment record for funding candidate {}",
+				candidate.txid,
+			);
+			self.payment_store.remove(&stray_id).await?;
+			self.pending_payment_store.remove(&stray_id).await?;
+		}
 		Ok(())
 	}
 
@@ -4603,6 +4668,152 @@ mod tests {
 
 		stop_sender.send(()).unwrap();
 		loop_task.await.unwrap();
+	}
+
+	/// Wallet sync can record a genuine replacement round before classification records it as a
+	/// candidate — e.g. the counterparty broadcast a round whose classification failed here and
+	/// is still being retried. The funding-status gate then routes the round's confirmation to a
+	/// stray record keyed by the round's txid, whose pending entry shadows the funding record in
+	/// `find_payment_by_txid`'s direct probe. Once the round's classification lands, it must
+	/// absorb the stray — adopt its confirmation and drop the duplicate — so a single record
+	/// tracks the splice.
+	#[tokio::test]
+	async fn classification_absorbs_stray_records_for_its_candidates() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+
+		let funding_id = PaymentId([21u8; 32]);
+		let txid1 = Txid::from_byte_array([1u8; 32]);
+		let txid2 = Txid::from_byte_array([2u8; 32]);
+
+		// Round 1 classified normally.
+		let round1 = vec![FundingTxCandidate {
+			txid: txid1,
+			amount_msat: Some(1_000_000),
+			fee_paid_msat: Some(500),
+		}];
+		let details = interactive_funding_details(funding_id, txid1, Some(1_000_000), Some(500));
+		wallet.persist_funding_payment(details, round1).await.unwrap();
+
+		// Wallet sync recorded round 2's confirmation while the round was not yet a candidate: a
+		// stray untyped record under the txid-derived id, plus its pending entry.
+		let stray_id = PaymentId(txid2.to_byte_array());
+		let stray = PaymentDetails::new(
+			stray_id,
+			PaymentKind::Onchain { txid: txid2, status: confirmed_status(), tx_type: None },
+			Some(999_000),
+			Some(999),
+			PaymentDirection::Outbound,
+			PaymentStatus::Pending,
+		);
+		wallet.payment_store.insert_or_update(stray.clone()).await.unwrap();
+		wallet
+			.pending_payment_store
+			.insert_or_update(PendingPaymentDetails::new(stray, Vec::new(), Vec::new()))
+			.await
+			.unwrap();
+		assert_eq!(wallet.find_payment_by_txid(txid2), Some(stray_id));
+
+		// Round 2's classification lands (e.g. retried after a persistence failure).
+		let rounds = vec![
+			FundingTxCandidate {
+				txid: txid1,
+				amount_msat: Some(1_000_000),
+				fee_paid_msat: Some(500),
+			},
+			FundingTxCandidate {
+				txid: txid2,
+				amount_msat: Some(1_000_000),
+				fee_paid_msat: Some(400),
+			},
+		];
+		let details = interactive_funding_details(funding_id, txid2, Some(1_000_000), Some(400));
+		wallet.persist_funding_payment(details, rounds).await.unwrap();
+
+		// One record: the funding record carries the stray's confirmation and the confirmed
+		// candidate's figures; the stray and its pending entry are gone, so the round's txid
+		// resolves to the funding record again.
+		let payments = wallet.payment_store.list_filter(|_| true);
+		assert_eq!(payments.len(), 1, "the stray duplicate must be absorbed");
+		let payment = &payments[0];
+		assert_eq!(payment.id, funding_id);
+		assert_eq!(payment.amount_msat, Some(1_000_000));
+		assert_eq!(payment.fee_paid_msat, Some(400));
+		match &payment.kind {
+			PaymentKind::Onchain {
+				txid,
+				status: ConfirmationStatus::Confirmed { .. },
+				tx_type: Some(TransactionType::InteractiveFunding { .. }),
+			} => assert_eq!(*txid, txid2),
+			kind => panic!("unexpected kind {:?}", kind),
+		}
+		assert!(wallet.pending_payment_store.get(&stray_id).is_none());
+		assert_eq!(wallet.find_payment_by_txid(txid2), Some(funding_id));
+	}
+
+	/// A stray for an *unconfirmed* round carries no state the funding record needs: absorbing
+	/// it removes the duplicate without touching the record's active txid or figures, and the
+	/// round's txid maps back to the funding record through its candidate history.
+	#[tokio::test]
+	async fn classification_drops_unconfirmed_strays_without_adopting_their_txid() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+
+		let funding_id = PaymentId([21u8; 32]);
+		let txid1 = Txid::from_byte_array([1u8; 32]);
+		let txid2 = Txid::from_byte_array([2u8; 32]);
+
+		// Wallet sync saw round 1 — still unconfirmed — before any classification ran.
+		let stray_id = PaymentId(txid1.to_byte_array());
+		let stray = PaymentDetails::new(
+			stray_id,
+			PaymentKind::Onchain {
+				txid: txid1,
+				status: ConfirmationStatus::Unconfirmed,
+				tx_type: None,
+			},
+			Some(999_000),
+			Some(999),
+			PaymentDirection::Outbound,
+			PaymentStatus::Pending,
+		);
+		wallet.payment_store.insert_or_update(stray.clone()).await.unwrap();
+		wallet
+			.pending_payment_store
+			.insert_or_update(PendingPaymentDetails::new(stray, Vec::new(), Vec::new()))
+			.await
+			.unwrap();
+
+		// Round 2 is the active broadcast; its classification lists both rounds.
+		let rounds = vec![
+			FundingTxCandidate {
+				txid: txid1,
+				amount_msat: Some(1_000_000),
+				fee_paid_msat: Some(500),
+			},
+			FundingTxCandidate {
+				txid: txid2,
+				amount_msat: Some(1_000_000),
+				fee_paid_msat: Some(400),
+			},
+		];
+		let details = interactive_funding_details(funding_id, txid2, Some(1_000_000), Some(400));
+		wallet.persist_funding_payment(details, rounds).await.unwrap();
+
+		let payments = wallet.payment_store.list_filter(|_| true);
+		assert_eq!(payments.len(), 1, "the stray duplicate must be absorbed");
+		let payment = &payments[0];
+		assert_eq!(payment.id, funding_id);
+		// The record keeps tracking the actively-broadcast round; a stray that never confirmed
+		// has nothing to adopt.
+		match &payment.kind {
+			PaymentKind::Onchain { txid, status: ConfirmationStatus::Unconfirmed, .. } => {
+				assert_eq!(*txid, txid2)
+			},
+			kind => panic!("unexpected kind {:?}", kind),
+		}
+		assert_eq!(payment.fee_paid_msat, Some(400));
+		assert_eq!(wallet.find_payment_by_txid(txid1), Some(funding_id));
 	}
 
 	/// Barrier test, classification-first ordering: wallet sync's confirmation handling must
