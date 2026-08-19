@@ -694,6 +694,15 @@ impl Node {
 			});
 		}
 
+		// Resume tracking persisted splice intents before event processing starts, so failure
+		// events LDK replays find their splice tracked, then resubmit any splices LDK dropped
+		// before durably recording them.
+		self.splice_retrier.seed();
+		let splice_retrier = Arc::clone(&self.splice_retrier);
+		self.runtime.spawn_background_task(async move {
+			splice_retrier.reconcile().await;
+		});
+
 		// Setup background processing
 		let background_persister = Arc::clone(&self.kv_store);
 		let background_event_handler = Arc::clone(&event_handler);
@@ -1813,10 +1822,10 @@ impl Node {
 	/// while waiting for a new funding transaction to confirm.
 	///
 	/// A recoverable failure (e.g. the peer disconnecting mid-negotiation) is retried
-	/// automatically while the node runs; [`Event::SpliceNegotiationFailed`] is emitted only once
-	/// the splice is given up on. A failure never handled while running is replayed by LDK after
-	/// a restart and its splice is resubmitted; only a splice whose negotiation failed without
-	/// LDK recording anything is dropped on restart.
+	/// automatically, including across restarts; [`Event::SpliceNegotiationFailed`] is emitted
+	/// only once the splice is given up on. If this method returns an error, the splice is
+	/// abandoned; however, if the abandonment cannot be persisted, the splice may still be
+	/// retried after a restart.
 	///
 	/// # Experimental API
 	///
@@ -1843,10 +1852,10 @@ impl Node {
 	/// while waiting for a new funding transaction to confirm.
 	///
 	/// A recoverable failure (e.g. the peer disconnecting mid-negotiation) is retried
-	/// automatically while the node runs; [`Event::SpliceNegotiationFailed`] is emitted only once
-	/// the splice is given up on. A failure never handled while running is replayed by LDK after
-	/// a restart and its splice is resubmitted; only a splice whose negotiation failed without
-	/// LDK recording anything is dropped on restart.
+	/// automatically, including across restarts; [`Event::SpliceNegotiationFailed`] is emitted
+	/// only once the splice is given up on. If this method returns an error, the splice is
+	/// abandoned; however, if the abandonment cannot be persisted, the splice may still be
+	/// retried after a restart.
 	///
 	/// # Experimental API
 	///
@@ -1865,10 +1874,10 @@ impl Node {
 	/// while waiting for a new funding transaction to confirm.
 	///
 	/// A recoverable failure (e.g. the peer disconnecting mid-negotiation) is retried
-	/// automatically while the node runs; [`Event::SpliceNegotiationFailed`] is emitted only once
-	/// the splice is given up on. A failure never handled while running is replayed by LDK after
-	/// a restart and its splice is resubmitted; only a splice whose negotiation failed without
-	/// LDK recording anything is dropped on restart.
+	/// automatically, including across restarts; [`Event::SpliceNegotiationFailed`] is emitted
+	/// only once the splice is given up on. If this method returns an error, the splice is
+	/// abandoned; however, if the abandonment cannot be persisted, the splice may still be
+	/// retried after a restart.
 	///
 	/// # Experimental API
 	///
@@ -1966,10 +1975,10 @@ impl Node {
 	/// Errors if the channel has no pending splice to bump.
 	///
 	/// A recoverable failure (e.g. the peer disconnecting mid-negotiation) is retried
-	/// automatically while the node runs; [`Event::SpliceNegotiationFailed`] is emitted only once
-	/// the fee bump is given up on. A failure never handled while running is replayed by LDK
-	/// after a restart and its fee bump is resubmitted; only a fee bump whose negotiation failed
-	/// without LDK recording anything is dropped on restart.
+	/// automatically, including across restarts; [`Event::SpliceNegotiationFailed`] is emitted
+	/// only once the fee bump is given up on. If this method returns an error, the fee bump is
+	/// abandoned; however, if the abandonment cannot be persisted, the fee bump may still be
+	/// retried after a restart.
 	pub fn bump_channel_funding_fee(
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
 	) -> Result<(), Error> {

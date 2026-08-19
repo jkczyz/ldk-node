@@ -14,12 +14,14 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Amount, OutPoint, TxOut};
 use lightning::chain::transaction::OutPoint as LdkOutPoint;
 use lightning::events::NegotiationFailureReason;
+use lightning::ln::channel_state::{SpliceCandidateDetails, SpliceCandidateStatus};
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::funding::FundingContribution;
 use lightning::ln::types::ChannelId;
 use lightning::util::errors::APIError;
 
 use crate::data_store::StorableObject;
+use crate::event::{Event, EventQueue};
 use crate::fee_estimator::{
 	max_funding_feerate, ConfirmationTarget, FeeEstimator, OnchainFeeEstimator,
 };
@@ -244,10 +246,15 @@ impl SpliceRegistry {
 ///
 /// Each tracked splice is also persisted as a [`SpliceIntent`]: written before the contribution
 /// is handed to LDK, updated on every resubmission, and cleared once the splice locks, its
-/// channel closes, or the failure is surfaced. LDK likewise persists the failure events
-/// themselves, so a failure that was never handled while running — e.g. a disconnect during
-/// shutdown — replays after a restart and its splice is adopted and resubmitted; a splice adopted
-/// that way is tracked in memory only, since the replayed event already covered the restart.
+/// channel closes, or the failure is surfaced. At startup, [`Self::seed`] resumes tracking the
+/// persisted intents — so failure events LDK replays find their splice tracked — and
+/// [`Self::reconcile`] resubmits any whose splice LDK dropped before durably recording it,
+/// including those lost to a crash before LDK persisted anything. LDK likewise persists the
+/// failure events themselves, so a failure that was never handled while running — e.g. a
+/// disconnect during shutdown — replays after a restart; a failure replayed with nothing
+/// persisted behind it (see [`Self::on_negotiation_failed`] on the torn give-up window) is
+/// adopted and tracked in memory only, since the event replay that produced it already covers a
+/// further restart.
 ///
 /// [`ChannelManager::funding_contributed`]: lightning::ln::channelmanager::ChannelManager::funding_contributed
 pub(crate) struct SpliceRetrier {
@@ -256,6 +263,7 @@ pub(crate) struct SpliceRetrier {
 	fee_estimator: Arc<OnchainFeeEstimator>,
 	pending_payment_store: Arc<PendingPaymentStore>,
 	payment_store: Arc<PaymentStore>,
+	event_queue: Arc<EventQueue<Arc<Logger>>>,
 	registry: SpliceRegistry,
 	/// Serializes [`Self::submit`]'s persist-register-and-hand-off sequence with
 	/// [`Self::on_negotiation_failed`]'s snapshot of the tracked splice. Without it, the failure
@@ -270,7 +278,8 @@ impl SpliceRetrier {
 	pub(crate) fn new(
 		channel_manager: Arc<ChannelManager>, wallet: Arc<Wallet>,
 		fee_estimator: Arc<OnchainFeeEstimator>, pending_payment_store: Arc<PendingPaymentStore>,
-		payment_store: Arc<PaymentStore>, logger: Arc<Logger>,
+		payment_store: Arc<PaymentStore>, event_queue: Arc<EventQueue<Arc<Logger>>>,
+		logger: Arc<Logger>,
 	) -> Self {
 		Self {
 			channel_manager,
@@ -278,9 +287,131 @@ impl SpliceRetrier {
 			fee_estimator,
 			pending_payment_store,
 			payment_store,
+			event_queue,
 			registry: SpliceRegistry::default(),
 			submit_lock: tokio::sync::Mutex::new(()),
 			logger,
+		}
+	}
+
+	/// Resumes tracking the persisted splice intents. Must run before event processing starts, so
+	/// a failure event LDK replays finds its splice tracked — classified against the persisted
+	/// attempt count and give-up-capable of clearing the intent — rather than adopted as a fresh,
+	/// memory-only splice with a reset attempt budget.
+	pub(crate) fn seed(&self) {
+		let records = self.pending_payment_store.list_filter(|p| p.splice_intent().is_some());
+		for record in records {
+			let Some(intent) = record.splice_intent() else {
+				continue;
+			};
+			let splice = PendingSplice {
+				channel_id: intent.channel_id,
+				counterparty_node_id: intent.counterparty_node_id,
+				pre_splice_funding_txo: intent.pre_splice_funding_txo.into_bitcoin_outpoint(),
+				contribution: intent.contribution.clone(),
+				kind: Some(intent.kind.clone()),
+				attempts: intent.attempts,
+				rejected: false,
+				payment_id: Some(record.id()),
+			};
+			self.registry.register(intent.user_channel_id, splice);
+		}
+	}
+
+	/// Reconciles the persisted splice intents against live channel state, resubmitting any splice
+	/// LDK dropped before durably recording it — including one lost to a crash before LDK
+	/// persisted anything, for which no failure event will ever replay. Run once at startup, after
+	/// [`Self::seed`].
+	pub(crate) async fn reconcile(&self) {
+		let records = self.pending_payment_store.list_filter(|p| p.splice_intent().is_some());
+		for record in records {
+			let payment_id = record.id();
+			let Some(intent) = record.splice_intent().cloned() else {
+				continue;
+			};
+			let user_channel_id = intent.user_channel_id;
+
+			let channel = self
+				.channel_manager
+				.list_channels_with_counterparty(&intent.counterparty_node_id)
+				.into_iter()
+				.find(|c| c.user_channel_id == user_channel_id.0);
+			let channel = match channel {
+				Some(channel) => channel,
+				None => {
+					// The channel is gone; there is nothing to splice anymore.
+					self.registry.clear(user_channel_id);
+					self.clear_persisted_intent(payment_id).await;
+					continue;
+				},
+			};
+
+			if channel.funding_txo != Some(intent.pre_splice_funding_txo) {
+				// The funding moved on, so the splice (or a replacement) locked.
+				self.registry.clear(user_channel_id);
+				self.clear_persisted_intent(payment_id).await;
+				continue;
+			}
+
+			let candidates = channel
+				.splice_details
+				.as_ref()
+				.map(|details| details.candidates.as_slice())
+				.unwrap_or(&[]);
+			match decide_reconcile(&intent, candidates) {
+				ReconcileDecision::Keep => continue,
+				ReconcileDecision::Abandon => {
+					self.abandon(payment_id, &intent).await;
+					continue;
+				},
+				ReconcileDecision::Resubmit => {},
+			}
+
+			if intent.attempts >= MAX_SPLICE_ATTEMPTS {
+				self.abandon(payment_id, &intent).await;
+				continue;
+			}
+
+			// The tracked splice may already have moved on — cleared by a `ChannelReady` or
+			// superseded by a replayed failure event processed concurrently — in which case
+			// whatever moved it owns it now.
+			let Some(splice) = self.registry.get(user_channel_id) else {
+				continue;
+			};
+			// The stored contribution is resubmitted verbatim: reconciliation restores the
+			// pre-crash hand-off exactly as the originating call made it. Any staleness is then
+			// handled the same way it would have been without the restart — a retriable failure
+			// comes back and the retry rebuilds, as the seeded splice carries its parameters.
+			log_info!(
+				self.logger,
+				"Resubmitting splice for channel {} with counterparty {}",
+				intent.channel_id,
+				intent.counterparty_node_id,
+			);
+			if self.resubmit(user_channel_id, splice, None).await {
+				self.abandon(payment_id, &intent).await;
+			}
+		}
+	}
+
+	/// Gives up on a persisted splice intent and surfaces the failure to the user. The splice
+	/// stays in the registry so a failure event LDK later replays for it is classified against
+	/// the tracked attempt count instead of being adopted afresh with a reset budget.
+	async fn abandon(&self, payment_id: PaymentId, intent: &SpliceIntent) {
+		log_error!(
+			self.logger,
+			"Abandoning splice for channel {} with counterparty {}",
+			intent.channel_id,
+			intent.counterparty_node_id,
+		);
+		self.clear_persisted_intent(payment_id).await;
+		let event = Event::SpliceNegotiationFailed {
+			channel_id: intent.channel_id,
+			user_channel_id: intent.user_channel_id,
+			counterparty_node_id: intent.counterparty_node_id,
+		};
+		if let Err(e) = self.event_queue.add_event(event).await {
+			log_error!(self.logger, "Failed to push to event queue: {}", e);
 		}
 	}
 
@@ -847,6 +978,53 @@ fn record_with_intent_cleared(
 	}
 }
 
+/// What [`SpliceRetrier::reconcile`] should do with a persisted intent, decided from the splice
+/// rounds LDK reports on the channel.
+#[derive(Debug, PartialEq, Eq)]
+enum ReconcileDecision {
+	/// Leave the intent in place without resubmitting.
+	Keep,
+	/// Hand the stored contribution back to LDK.
+	Resubmit,
+	/// Give up: drop the intent and surface the failure to the user.
+	Abandon,
+}
+
+/// Decides the startup action for a persisted intent from the channel's [`SpliceDetails`]
+/// candidates.
+///
+/// [`SpliceDetails`]: lightning::ln::channel_state::SpliceDetails
+fn decide_reconcile(
+	intent: &SpliceIntent, candidates: &[SpliceCandidateDetails],
+) -> ReconcileDecision {
+	// A round short of `Negotiated` is one LDK still drives on its own: only `AwaitingSignatures`
+	// survives a restart, and LDK resumes the signature exchange itself on reconnect.
+	let in_flight = candidates
+		.iter()
+		.any(|candidate| !matches!(candidate.status, SpliceCandidateStatus::Negotiated { .. }));
+	if in_flight {
+		return ReconcileDecision::Keep;
+	}
+
+	// LDK persists a splice once negotiated, so a negotiated candidate carrying our contribution
+	// means the intent was carried out — unless the intent was a fee bump at a higher feerate
+	// than negotiated. Rounds carry our contribution forward, so the newest one holds it.
+	let negotiated = candidates.iter().rev().find_map(|candidate| candidate.contribution.as_ref());
+	match (&intent.kind, negotiated) {
+		(SpliceKind::Rbf {}, Some(prior)) => {
+			if prior.feerate() < intent.contribution.feerate() {
+				ReconcileDecision::Resubmit
+			} else {
+				ReconcileDecision::Keep
+			}
+		},
+		// The splice to bump is gone entirely; surface rather than guess.
+		(SpliceKind::Rbf {}, None) => ReconcileDecision::Abandon,
+		(_, Some(_)) => ReconcileDecision::Keep,
+		(_, None) => ReconcileDecision::Resubmit,
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
@@ -1159,5 +1337,79 @@ mod tests {
 		registry.register(user_channel_id, test_splice(test_funding_contribution()));
 		registry.clear(user_channel_id);
 		assert!(registry.get(user_channel_id).is_none());
+	}
+
+	fn negotiated_candidate(contribution: Option<FundingContribution>) -> SpliceCandidateDetails {
+		SpliceCandidateDetails {
+			contribution,
+			status: SpliceCandidateStatus::Negotiated {
+				txid: Txid::from_byte_array([9u8; 32]),
+				new_channel_value_satoshis: 100_000,
+			},
+		}
+	}
+
+	/// While any round is short of `Negotiated`, LDK drives the splice itself; the intent stays
+	/// untouched until it settles.
+	#[test]
+	fn reconcile_keeps_the_intent_while_ldk_drives_a_round() {
+		let intent = test_intent();
+		let in_flight = SpliceCandidateDetails {
+			contribution: Some(test_funding_contribution()),
+			status: SpliceCandidateStatus::AwaitingSignatures {
+				is_initiator: true,
+				funding_feerate_sat_per_1000_weight: 253,
+				new_channel_value_satoshis: 100_000,
+				txid: Txid::from_byte_array([9u8; 32]),
+			},
+		};
+		assert_eq!(decide_reconcile(&intent, &[in_flight]), ReconcileDecision::Keep);
+	}
+
+	/// A negotiated candidate carrying our contribution means the intent was carried out;
+	/// resubmitting would duplicate the splice. This holds on zero-conf channels too, where the
+	/// pre-splice funding outpoint has not moved on yet.
+	#[test]
+	fn reconcile_trusts_a_negotiated_contribution() {
+		let mut intent = test_intent();
+		intent.kind = SpliceKind::In { amount_sats: 10_000 };
+		let negotiated = [negotiated_candidate(Some(test_funding_contribution()))];
+		assert_eq!(decide_reconcile(&intent, &negotiated), ReconcileDecision::Keep);
+	}
+
+	/// With no contribution of ours in LDK — no splice at all, or only a counterparty round — the
+	/// original splice is resubmitted, while a fee bump has nothing left to replace and gives up.
+	#[test]
+	fn reconcile_resubmits_when_ldk_holds_no_contribution() {
+		let mut intent = test_intent();
+		intent.kind = SpliceKind::In { amount_sats: 10_000 };
+		assert_eq!(decide_reconcile(&intent, &[]), ReconcileDecision::Resubmit);
+		let counterparty_only = [negotiated_candidate(None)];
+		assert_eq!(decide_reconcile(&intent, &counterparty_only), ReconcileDecision::Resubmit);
+
+		intent.kind = SpliceKind::Rbf {};
+		assert_eq!(decide_reconcile(&intent, &[]), ReconcileDecision::Abandon);
+		let counterparty_only = [negotiated_candidate(None)];
+		assert_eq!(decide_reconcile(&intent, &counterparty_only), ReconcileDecision::Abandon);
+	}
+
+	/// A fee bump resubmits only when it improves on the negotiated feerate, judged against the
+	/// newest round since rounds carry the contribution forward.
+	#[test]
+	fn reconcile_resubmits_a_bump_only_at_a_higher_feerate() {
+		let mut intent = test_intent();
+		intent.contribution = test_funding_contribution_with_feerate(500);
+
+		let lower = [negotiated_candidate(Some(test_funding_contribution_with_feerate(253)))];
+		assert_eq!(decide_reconcile(&intent, &lower), ReconcileDecision::Resubmit);
+
+		let higher = [negotiated_candidate(Some(test_funding_contribution_with_feerate(1000)))];
+		assert_eq!(decide_reconcile(&intent, &higher), ReconcileDecision::Keep);
+
+		let bumped_meanwhile = [
+			negotiated_candidate(Some(test_funding_contribution_with_feerate(253))),
+			negotiated_candidate(Some(test_funding_contribution_with_feerate(1000))),
+		];
+		assert_eq!(decide_reconcile(&intent, &bumped_meanwhile), ReconcileDecision::Keep);
 	}
 }
