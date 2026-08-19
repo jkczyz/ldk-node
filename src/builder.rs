@@ -2341,6 +2341,8 @@ fn build_with_store_internal(
 		Arc::clone(&channel_manager),
 		Arc::clone(&wallet),
 		Arc::clone(&fee_estimator),
+		Arc::clone(&pending_payment_store),
+		Arc::clone(&payment_store),
 		Arc::clone(&logger),
 	));
 

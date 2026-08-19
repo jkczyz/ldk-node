@@ -1903,7 +1903,9 @@ where
 					.handle_channel_ready(user_channel_id, &channel_id, &counterparty_node_id)
 					.await;
 
-				self.splice_retrier.on_channel_ready(UserChannelId(user_channel_id), funding_txo);
+				self.splice_retrier
+					.on_channel_ready(UserChannelId(user_channel_id), funding_txo)
+					.await;
 
 				let event = Event::ChannelReady {
 					channel_id,
@@ -1928,7 +1930,7 @@ where
 			} => {
 				log_info!(self.logger, "Channel {} closed due to: {}", channel_id, reason);
 
-				self.splice_retrier.on_channel_closed(UserChannelId(user_channel_id));
+				self.splice_retrier.on_channel_closed(UserChannelId(user_channel_id)).await;
 
 				// `counterparty_node_id` has been set on every `ChannelClosed` since LDK 0.0.117.
 				let counterparty_node_id = counterparty_node_id

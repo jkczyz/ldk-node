@@ -12,17 +12,25 @@ use std::sync::{Arc, Mutex};
 
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Amount, OutPoint, TxOut};
+use lightning::chain::transaction::OutPoint as LdkOutPoint;
 use lightning::events::NegotiationFailureReason;
+use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::funding::FundingContribution;
 use lightning::ln::types::ChannelId;
 use lightning::util::errors::APIError;
 
+use crate::data_store::StorableObject;
 use crate::fee_estimator::{
 	max_funding_feerate, ConfirmationTarget, FeeEstimator, OnchainFeeEstimator,
 };
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
-use crate::payment::pending_payment_store::SpliceKind;
-use crate::types::{ChannelManager, UserChannelId, Wallet};
+use crate::payment::pending_payment_store::{
+	PendingPaymentDetails, PendingPaymentDetailsUpdate, SpliceIntent, SpliceKind,
+};
+use crate::payment::store::PaymentDetails;
+use crate::payment::PaymentStatus;
+use crate::types::{ChannelManager, PaymentStore, PendingPaymentStore, UserChannelId, Wallet};
+use crate::wallet::random_payment_id;
 use crate::Error;
 
 /// The number of times a splice contribution is resubmitted to LDK before the splice is given up
@@ -89,6 +97,10 @@ struct PendingSplice {
 	/// call already surfaced that error, so a failure event the rejection may have enqueued must
 	/// be consumed rather than reported a second time or retried.
 	rejected: bool,
+	/// The [`PaymentId`] of the persisted [`SpliceIntent`] record backing this splice, or `None`
+	/// for a splice adopted from a replayed failure event, which is tracked in memory only: the
+	/// event replay that produced it already covers a further restart.
+	payment_id: Option<PaymentId>,
 }
 
 /// What a `SpliceNegotiationFailed` means for the splice we track for its channel, decided purely
@@ -230,74 +242,227 @@ impl SpliceRegistry {
 /// Resubmitting does not require the peer to be connected: LDK holds on to the contribution and
 /// initiates quiescence once the peer reconnects.
 ///
-/// The tracked state is in-memory only, so retries do not survive a restart. LDK does persist the
-/// failure events themselves, so a failure that was never handled while running — e.g. a
-/// disconnect during shutdown — replays after a restart and its splice is adopted and resubmitted.
-/// A splice whose negotiation failed without LDK recording anything is dropped on restart.
+/// Each tracked splice is also persisted as a [`SpliceIntent`]: written before the contribution
+/// is handed to LDK, updated on every resubmission, and cleared once the splice locks, its
+/// channel closes, or the failure is surfaced. LDK likewise persists the failure events
+/// themselves, so a failure that was never handled while running — e.g. a disconnect during
+/// shutdown — replays after a restart and its splice is adopted and resubmitted; a splice adopted
+/// that way is tracked in memory only, since the replayed event already covered the restart.
 ///
 /// [`ChannelManager::funding_contributed`]: lightning::ln::channelmanager::ChannelManager::funding_contributed
 pub(crate) struct SpliceRetrier {
 	channel_manager: Arc<ChannelManager>,
 	wallet: Arc<Wallet>,
 	fee_estimator: Arc<OnchainFeeEstimator>,
+	pending_payment_store: Arc<PendingPaymentStore>,
+	payment_store: Arc<PaymentStore>,
 	registry: SpliceRegistry,
-	/// Serializes [`Self::submit`]'s register-and-hand-off sequence with
+	/// Serializes [`Self::submit`]'s persist-register-and-hand-off sequence with
 	/// [`Self::on_negotiation_failed`]'s snapshot of the tracked splice. Without it, the failure
 	/// event of a synchronously rejected hand-off could be classified while the splice is still
 	/// cleanly registered — resubmitting a contribution whose originating call already returned
 	/// an error.
-	submit_lock: Mutex<()>,
+	submit_lock: tokio::sync::Mutex<()>,
 	logger: Arc<Logger>,
 }
 
 impl SpliceRetrier {
 	pub(crate) fn new(
 		channel_manager: Arc<ChannelManager>, wallet: Arc<Wallet>,
-		fee_estimator: Arc<OnchainFeeEstimator>, logger: Arc<Logger>,
+		fee_estimator: Arc<OnchainFeeEstimator>, pending_payment_store: Arc<PendingPaymentStore>,
+		payment_store: Arc<PaymentStore>, logger: Arc<Logger>,
 	) -> Self {
 		Self {
 			channel_manager,
 			wallet,
 			fee_estimator,
+			pending_payment_store,
+			payment_store,
 			registry: SpliceRegistry::default(),
-			submit_lock: Mutex::new(()),
+			submit_lock: tokio::sync::Mutex::new(()),
 			logger,
 		}
 	}
 
-	/// Tracks a user-initiated splice and hands its contribution to
-	/// [`ChannelManager::funding_contributed`]. Tracking starts before the hand-off, so a failure
-	/// event cannot arrive before the splice it concerns is tracked. A newer splice supersedes
-	/// whatever was tracked for the channel: at most one splice is ever in flight per channel,
-	/// and a fee bump replaces the splice it bumps.
+	/// Tracks a user-initiated splice — persisting its intent — and hands its contribution to
+	/// [`ChannelManager::funding_contributed`]. The intent is persisted and tracking starts
+	/// before the hand-off, so a crash in between is covered and a failure event cannot arrive
+	/// before the splice it concerns is tracked. A newer splice supersedes whatever was tracked
+	/// for the channel: at most one splice is ever in flight per channel, and a fee bump replaces
+	/// the splice it bumps.
 	///
-	/// On a synchronous rejection the error is returned for the caller to surface, and the splice
-	/// stays tracked but marked rejected: LDK may still enqueue a `SpliceNegotiationFailed` for
-	/// the rejected contribution, which must be consumed rather than reported a second time.
+	/// On a synchronous rejection the error is returned for the caller to surface and the
+	/// persisted intent is undone, but the splice stays tracked marked rejected: LDK may still
+	/// enqueue a `SpliceNegotiationFailed` for the rejected contribution, which must be consumed
+	/// rather than reported a second time.
 	///
 	/// [`ChannelManager::funding_contributed`]: lightning::ln::channelmanager::ChannelManager::funding_contributed
-	pub(crate) fn submit(
+	pub(crate) async fn submit(
 		&self, user_channel_id: UserChannelId, counterparty_node_id: PublicKey,
-		channel_id: ChannelId, pre_splice_funding_txo: OutPoint, contribution: FundingContribution,
-		kind: SpliceKind,
-	) -> Result<(), APIError> {
-		let _guard = self.submit_lock.lock().unwrap();
+		channel_id: ChannelId, pre_splice_funding_txo: LdkOutPoint,
+		contribution: FundingContribution, kind: SpliceKind,
+	) -> Result<(), Error> {
+		let _guard = self.submit_lock.lock().await;
+		let intent = SpliceIntent {
+			user_channel_id,
+			counterparty_node_id,
+			channel_id,
+			pre_splice_funding_txo,
+			contribution: contribution.clone(),
+			kind: kind.clone(),
+			attempts: 0,
+		};
+		// A splice whose intent cannot be persisted is not attempted at all, rather than
+		// attempted without restart coverage.
+		let (payment_id, restore) = self.persist_intent(intent).await.map_err(|e| {
+			log_error!(
+				self.logger,
+				"Failed to persist the splice intent for channel {} with counterparty {}: {:?}",
+				channel_id,
+				counterparty_node_id,
+				e,
+			);
+			e
+		})?;
 		let splice = PendingSplice {
 			channel_id,
 			counterparty_node_id,
-			pre_splice_funding_txo,
+			pre_splice_funding_txo: pre_splice_funding_txo.into_bitcoin_outpoint(),
 			contribution: contribution.clone(),
 			kind: Some(kind),
 			attempts: 0,
 			rejected: false,
+			payment_id: Some(payment_id),
 		};
 		self.registry.register(user_channel_id, splice.clone());
-		self.channel_manager
-			.funding_contributed(&channel_id, &counterparty_node_id, contribution, None)
-			.map_err(|e| {
-				self.registry.register(user_channel_id, PendingSplice { rejected: true, ..splice });
-				e
+		if let Err(e) = self.channel_manager.funding_contributed(
+			&channel_id,
+			&counterparty_node_id,
+			contribution,
+			None,
+		) {
+			log_error!(
+				self.logger,
+				"LDK rejected the splice contribution for channel {} with counterparty {}: {:?}",
+				channel_id,
+				counterparty_node_id,
+				e,
+			);
+			self.registry.register(user_channel_id, PendingSplice { rejected: true, ..splice });
+			// The caller surfaces the rejection, so the splice must not be resubmitted after a
+			// restart: undo the persisted intent.
+			self.discard_persisted_intent(&payment_id, restore).await;
+			return Err(Error::ChannelSplicingFailed);
+		}
+		Ok(())
+	}
+
+	/// Persists `intent` before its contribution is handed to LDK, so the splice can be
+	/// resubmitted if LDK drops it before durably recording it (a restart, or a disconnect
+	/// mid-negotiation).
+	///
+	/// Reuses the channel's existing splice intent record when one is present — so a splice and
+	/// its later fee bumps share one [`PaymentId`] and at most one intent ever exists per
+	/// channel, which `Wallet::find_splice_payment_id` relies on — otherwise generates a fresh
+	/// id. Returns the id and, for restoring on a rejected hand-off, `None` when a fresh record
+	/// was created or `Some(prior)` when an existing record's intent was replaced.
+	async fn persist_intent(
+		&self, intent: SpliceIntent,
+	) -> Result<(PaymentId, Option<Option<SpliceIntent>>), Error> {
+		let existing = self
+			.pending_payment_store
+			.list_filter(|p| {
+				p.splice_intent().is_some_and(|i| i.user_channel_id == intent.user_channel_id)
 			})
+			.into_iter()
+			.next();
+		match existing {
+			Some(record) => {
+				let payment_id = record.id();
+				let prior = record.splice_intent().cloned();
+				self.pending_payment_store
+					.update(PendingPaymentDetailsUpdate {
+						id: payment_id,
+						payment_update: None,
+						conflicting_txids: None,
+						candidates: Vec::new(),
+						splice_intent: Some(Some(intent)),
+					})
+					.await?;
+				Ok((payment_id, Some(prior)))
+			},
+			None => {
+				let payment_id = random_payment_id();
+				self.pending_payment_store
+					.insert(PendingPaymentDetails::pending_splice(payment_id, intent))
+					.await?;
+				Ok((payment_id, None))
+			},
+		}
+	}
+
+	/// Undoes a splice intent persisted for a hand-off LDK then synchronously rejected: restores
+	/// an existing record's prior intent, or removes a freshly created record.
+	async fn discard_persisted_intent(
+		&self, payment_id: &PaymentId, restore: Option<Option<SpliceIntent>>,
+	) {
+		let result = match restore {
+			Some(prior) => self
+				.pending_payment_store
+				.update(PendingPaymentDetailsUpdate {
+					id: *payment_id,
+					payment_update: None,
+					conflicting_txids: None,
+					candidates: Vec::new(),
+					splice_intent: Some(prior),
+				})
+				.await
+				.map(|_| ()),
+			None => self.pending_payment_store.remove(payment_id).await,
+		};
+		if let Err(e) = result {
+			log_error!(
+				self.logger,
+				"Failed to undo the intent of rejected splice payment {}: it may be resubmitted \
+				after a restart: {}",
+				payment_id,
+				e,
+			);
+		}
+	}
+
+	/// Clears the persisted intent behind a splice that locked, was given up on, or whose channel
+	/// closed: removes a record with no classified funding payment behind it entirely, or keeps
+	/// the record — with the intent cleared — when a payment exists, so the payment keeps
+	/// graduating.
+	async fn clear_persisted_intent(&self, payment_id: PaymentId) {
+		let Some(record) = self.pending_payment_store.get(&payment_id) else {
+			return;
+		};
+		let has_payment = record.details().is_some()
+			|| self
+				.payment_store
+				.get(&payment_id)
+				.is_some_and(|details| details.status == PaymentStatus::Pending);
+		let result = if has_payment {
+			self.pending_payment_store
+				.mutate(&payment_id, |existing| {
+					record_with_intent_cleared(existing, self.payment_store.get(&payment_id))
+				})
+				.await
+				.map(|_| ())
+		} else {
+			self.pending_payment_store.remove(&payment_id).await
+		};
+		if let Err(e) = result {
+			log_error!(
+				self.logger,
+				"Failed to clear the persisted intent of splice payment {}: the splice may be \
+				resubmitted after a restart: {}",
+				payment_id,
+				e,
+			);
+		}
 	}
 
 	/// Applies a `SpliceNegotiationFailed` to any tracked splice, retrying recoverable failures.
@@ -311,7 +476,7 @@ impl SpliceRetrier {
 		let tracked = {
 			// Serialize with `submit`: a synchronously rejected hand-off must finish marking its
 			// entry rejected before the failure event it may have enqueued is classified.
-			let _guard = self.submit_lock.lock().unwrap();
+			let _guard = self.submit_lock.lock().await;
 			self.registry.get(user_channel_id)
 		};
 		let (splice, decision) =
@@ -340,7 +505,7 @@ impl SpliceRetrier {
 				},
 			};
 
-		match decision {
+		let surface = match decision {
 			RetryDecision::Abandon => {
 				log_error!(
 					self.logger,
@@ -372,15 +537,16 @@ impl SpliceRetrier {
 						splice.counterparty_node_id,
 						e,
 					);
-					return true;
+					true
+				} else {
+					log_info!(
+						self.logger,
+						"Resubmitting splice for channel {} with counterparty {} after a recoverable failure",
+						splice.channel_id,
+						splice.counterparty_node_id,
+					);
+					self.resubmit(user_channel_id, splice.clone(), None).await
 				}
-				log_info!(
-					self.logger,
-					"Resubmitting splice for channel {} with counterparty {} after a recoverable failure",
-					splice.channel_id,
-					splice.counterparty_node_id,
-				);
-				self.resubmit(user_channel_id, splice, None).await
 			},
 			RetryDecision::Rebuild => {
 				let kind = splice.kind.clone().expect(
@@ -413,23 +579,60 @@ impl SpliceRetrier {
 					splice.channel_id,
 					splice.counterparty_node_id,
 				);
-				self.resubmit(user_channel_id, splice, rebuilt).await
+				self.resubmit(user_channel_id, splice.clone(), rebuilt).await
 			},
+		};
+		if surface {
+			// A surfaced failure is final: clear the persisted intent so a restart does not
+			// resubmit a splice the user watched fail. Clearing before the caller's event-queue
+			// write leaves one torn window — a crash in between replays the failure event with
+			// nothing persisted, and the replay is adopted for a fresh retry cycle instead of
+			// surfacing — which errs on the side of retrying over losing the splice.
+			if let Some(payment_id) = splice.payment_id {
+				self.clear_persisted_intent(payment_id).await;
+			}
 		}
+		surface
 	}
 
 	/// Clears any tracked splice made obsolete by a newly locked funding transaction.
-	pub(crate) fn on_channel_ready(
+	pub(crate) async fn on_channel_ready(
 		&self, user_channel_id: UserChannelId, funding_txo: Option<OutPoint>,
 	) {
-		if let Some(funding_txo) = funding_txo {
-			self.registry.clear_if_obsoleted(user_channel_id, funding_txo);
+		let Some(funding_txo) = funding_txo else {
+			return;
+		};
+		self.registry.clear_if_obsoleted(user_channel_id, funding_txo);
+		// Mirror the clear onto the persisted intent, which likewise only goes when it predates
+		// the locked funding: an intent whose pre-splice outpoint is the newly locked funding
+		// was created after this lock and is still pending.
+		if let Some(record) = self.record_for_channel(user_channel_id) {
+			let obsolete = record.splice_intent().is_some_and(|intent| {
+				intent.pre_splice_funding_txo.into_bitcoin_outpoint() != funding_txo
+			});
+			if obsolete {
+				self.clear_persisted_intent(record.id()).await;
+			}
 		}
 	}
 
 	/// Clears any tracked splice for a closed channel, as there is nothing left to splice.
-	pub(crate) fn on_channel_closed(&self, user_channel_id: UserChannelId) {
+	pub(crate) async fn on_channel_closed(&self, user_channel_id: UserChannelId) {
 		self.registry.clear(user_channel_id);
+		if let Some(record) = self.record_for_channel(user_channel_id) {
+			self.clear_persisted_intent(record.id()).await;
+		}
+	}
+
+	/// Returns the pending record carrying a splice intent for the given channel, if any. A fee
+	/// bump reuses the channel's existing intent record, so at most one record matches.
+	fn record_for_channel(&self, user_channel_id: UserChannelId) -> Option<PendingPaymentDetails> {
+		self.pending_payment_store
+			.list_filter(|p| {
+				p.splice_intent().is_some_and(|i| i.user_channel_id == user_channel_id)
+			})
+			.into_iter()
+			.next()
 	}
 
 	/// Starts tracking the splice behind a failure event that arrived with nothing tracked: LDK
@@ -455,6 +658,7 @@ impl SpliceRetrier {
 			kind: None,
 			attempts: 0,
 			rejected: false,
+			payment_id: None,
 		};
 		log_info!(
 			self.logger,
@@ -487,6 +691,23 @@ impl SpliceRetrier {
 			contribution.clone(),
 		) {
 			return false;
+		}
+		if let Some(payment_id) = splice.payment_id {
+			// Persist the incremented attempt count — and the contribution being resubmitted —
+			// before the hand-off, so a crash mid-submission cannot lead to unbounded retries.
+			// If it cannot be persisted, LDK never receives the contribution and nothing further
+			// fires for this attempt: give up and surface the failure rather than swallow it.
+			if let Err(e) =
+				self.persist_attempt(payment_id, splice.attempts + 1, &contribution).await
+			{
+				log_error!(
+					self.logger,
+					"Giving up on splice for channel {}: failed to persist the splice attempt: {}",
+					splice.channel_id,
+					e,
+				);
+				return true;
+			}
 		}
 		if resubmitting_stored {
 			// The failed attempt's `DiscardFunding` released the stored contribution's change
@@ -527,6 +748,33 @@ impl SpliceRetrier {
 			}
 		}
 		false
+	}
+
+	/// Mirrors a resubmission onto the persisted intent: bumps its attempt count and swaps in the
+	/// contribution being resubmitted. A record whose intent is already gone (e.g. the splice
+	/// locked in the meantime) is left untouched.
+	async fn persist_attempt(
+		&self, payment_id: PaymentId, attempts: u8, contribution: &FundingContribution,
+	) -> Result<(), Error> {
+		self.pending_payment_store
+			.mutate(&payment_id, |existing| {
+				let record = existing?;
+				let mut intent = record.splice_intent()?.clone();
+				intent.attempts = attempts;
+				intent.contribution = contribution.clone();
+				let mut updated = record.clone();
+				updated
+					.update(PendingPaymentDetailsUpdate {
+						id: payment_id,
+						payment_update: None,
+						conflicting_txids: None,
+						candidates: Vec::new(),
+						splice_intent: Some(Some(intent)),
+					})
+					.then_some(updated)
+			})
+			.await
+			.map(|_| ())
 	}
 
 	/// Builds a fresh contribution from the parameters of the originating API call, mirroring the
@@ -571,6 +819,34 @@ impl SpliceRetrier {
 	}
 }
 
+/// The replacement for a pending record whose splice intent is being dropped. A tracked record
+/// keeps its payment details with just the intent cleared. A pre-broadcast record whose payment
+/// was classified but never mirrored into the pending store — a crash between classification's
+/// two store writes — is promoted so the payment keeps graduating and its txids stay mapped; a
+/// payment no longer `Pending` graduated already and must not be re-indexed, so its entry is
+/// left alone for removal.
+fn record_with_intent_cleared(
+	existing: Option<&PendingPaymentDetails>, recorded: Option<PaymentDetails>,
+) -> Option<PendingPaymentDetails> {
+	match existing {
+		Some(PendingPaymentDetails::PendingSplice { .. }) => recorded
+			.filter(|details| details.status == PaymentStatus::Pending)
+			.map(|details| PendingPaymentDetails::tracked(details, Vec::new(), Vec::new(), None)),
+		Some(tracked @ PendingPaymentDetails::Tracked { .. }) => {
+			let update = PendingPaymentDetailsUpdate {
+				id: tracked.id(),
+				payment_update: None,
+				conflicting_txids: None,
+				candidates: Vec::new(),
+				splice_intent: Some(None),
+			};
+			let mut updated = tracked.clone();
+			updated.update(update).then_some(updated)
+		},
+		None => None,
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
@@ -582,6 +858,8 @@ mod tests {
 	use crate::payment::pending_payment_store::{
 		test_funding_contribution, test_funding_contribution_with_feerate,
 	};
+	use crate::payment::store::{ConfirmationStatus, PaymentKind};
+	use crate::payment::PaymentDirection;
 
 	#[test]
 	fn decide_retry_matrix() {
@@ -618,7 +896,84 @@ mod tests {
 			kind: Some(SpliceKind::In { amount_sats: 10_000 }),
 			attempts: 0,
 			rejected: false,
+			payment_id: None,
 		}
+	}
+
+	fn test_intent() -> SpliceIntent {
+		SpliceIntent {
+			user_channel_id: UserChannelId(42),
+			counterparty_node_id: PublicKey::from_str(
+				"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+			)
+			.unwrap(),
+			channel_id: ChannelId([7u8; 32]),
+			pre_splice_funding_txo: LdkOutPoint {
+				txid: Txid::from_byte_array([3u8; 32]),
+				index: 0,
+			},
+			contribution: test_funding_contribution(),
+			kind: SpliceKind::Rbf {},
+			attempts: 0,
+		}
+	}
+
+	fn payment_details(id: PaymentId, status: PaymentStatus) -> PaymentDetails {
+		PaymentDetails::new(
+			id,
+			PaymentKind::Onchain {
+				txid: Txid::from_byte_array([1u8; 32]),
+				status: ConfirmationStatus::Unconfirmed,
+				tx_type: None,
+			},
+			Some(1_000_000),
+			Some(500),
+			PaymentDirection::Outbound,
+			status,
+		)
+	}
+
+	/// A crash between classification's two store writes leaves the pending entry pre-broadcast
+	/// while the classified payment record exists. Dropping the intent must promote the entry
+	/// rather than remove it, so the payment keeps graduating and its txids stay mapped.
+	#[test]
+	fn intent_clearing_promotes_a_pre_broadcast_record_over_a_classified_payment() {
+		let id = PaymentId([9u8; 32]);
+		let existing = PendingPaymentDetails::pending_splice(id, test_intent());
+		let recorded = payment_details(id, PaymentStatus::Pending);
+
+		let replacement = record_with_intent_cleared(Some(&existing), Some(recorded.clone()));
+		let replacement = replacement.expect("the entry must be promoted, not removed");
+		assert_eq!(replacement.details(), Some(&recorded));
+		assert!(replacement.splice_intent().is_none());
+	}
+
+	/// A payment that already advanced beyond `Pending` graduated and lost its pending entry;
+	/// promotion must not re-index it.
+	#[test]
+	fn intent_clearing_does_not_reindex_an_advanced_payment() {
+		let id = PaymentId([9u8; 32]);
+		let existing = PendingPaymentDetails::pending_splice(id, test_intent());
+		let recorded = payment_details(id, PaymentStatus::Succeeded);
+		assert!(record_with_intent_cleared(Some(&existing), Some(recorded)).is_none());
+	}
+
+	/// A tracked record keeps its payment details; only the intent is cleared.
+	#[test]
+	fn intent_clearing_keeps_a_tracked_record() {
+		let id = PaymentId([9u8; 32]);
+		let details = payment_details(id, PaymentStatus::Pending);
+		let existing = PendingPaymentDetails::tracked(
+			details.clone(),
+			Vec::new(),
+			Vec::new(),
+			Some(test_intent()),
+		);
+
+		let replacement = record_with_intent_cleared(Some(&existing), Some(details.clone()));
+		let replacement = replacement.expect("the entry must survive with its intent cleared");
+		assert_eq!(replacement.details(), Some(&details));
+		assert!(replacement.splice_intent().is_none());
 	}
 
 	#[test]

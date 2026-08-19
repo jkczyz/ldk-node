@@ -1892,6 +1892,7 @@ impl Wallet {
 		// is ordered before the removal, which then also deletes anything inserted here. A
 		// status read taken before this write goes stale when graduation lands in between, and
 		// would re-index the graduated payment.
+		let mut remove_leftover_intent_record = false;
 		self.pending_payment_store
 			.mutate(&id, |existing| {
 				// The record was written above and payment records are never removed, so absence
@@ -1911,12 +1912,11 @@ impl Wallet {
 					}),
 					// A user-initiated splice has a pre-broadcast `PendingSplice` intent under
 					// this id; carry its intent into the `Tracked` record so promotion does
-					// not drop it (nothing persists or consumes intents yet — that arrives
-					// with the follow-up that makes splice retries survive restarts). If the
-					// payment already advanced beyond `Pending` (wallet sync confirmed it
-					// through `ANTI_REORG_DELAY` first), it must not enter the pending store;
-					// the leftover intent record stays until that follow-up adds its clearing
-					// path.
+					// not drop it. If the payment already advanced beyond `Pending` (wallet
+					// sync confirmed it through `ANTI_REORG_DELAY` first), it must not enter
+					// the pending store — and the splice its intent would resubmit confirmed,
+					// so the leftover record is removed below rather than left to resubmit
+					// the splice after a restart.
 					Some(PendingPaymentDetails::PendingSplice { intent, .. }) => {
 						if recorded.status == PaymentStatus::Pending {
 							Some(PendingPaymentDetails::tracked(
@@ -1926,6 +1926,7 @@ impl Wallet {
 								Some(intent.clone()),
 							))
 						} else {
+							remove_leftover_intent_record = true;
 							None
 						}
 					},
@@ -1948,6 +1949,9 @@ impl Wallet {
 				}
 			})
 			.await?;
+		if remove_leftover_intent_record {
+			self.pending_payment_store.remove(&id).await?;
+		}
 
 		// With the candidate history recorded, duplicates wallet sync minted for rounds that were
 		// not yet candidates can be folded back into this record. Runs after both writes so the
@@ -2555,7 +2559,7 @@ fn aggregate_local_stakes(candidate: &FundingCandidate) -> LocalStakeAggregate {
 /// Mints a fresh funding-record [`PaymentId`] from the OS entropy source. A funding record's id
 /// carries no meaning beyond uniqueness: the record is found through its transaction history
 /// ([`Wallet::find_payment_by_txid`]), never re-derived from a txid.
-fn random_payment_id() -> PaymentId {
+pub(crate) fn random_payment_id() -> PaymentId {
 	let mut bytes = [0u8; 32];
 	getrandom::fill(&mut bytes).expect("getrandom failed");
 	PaymentId(bytes)
@@ -3146,6 +3150,107 @@ mod tests {
 		wallet.cancel_tx(tx).await.unwrap();
 		wallet.reserve_tx_outputs(&[txout]).await.unwrap();
 		assert_ne!(wallet.get_new_internal_address().await.unwrap(), address);
+	}
+
+	fn test_splice_intent() -> crate::payment::pending_payment_store::SpliceIntent {
+		use crate::payment::pending_payment_store::{SpliceIntent, SpliceKind};
+		use crate::types::UserChannelId;
+
+		SpliceIntent {
+			user_channel_id: UserChannelId(42),
+			counterparty_node_id: PublicKey::from_str(
+				"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+			)
+			.unwrap(),
+			channel_id: ChannelId([13u8; 32]),
+			pre_splice_funding_txo: lightning::chain::transaction::OutPoint {
+				txid: Txid::from_byte_array([3u8; 32]),
+				index: 0,
+			},
+			contribution: crate::payment::pending_payment_store::test_funding_contribution(),
+			kind: SpliceKind::In { amount_sats: 10_000 },
+			attempts: 0,
+		}
+	}
+
+	fn funding_payment(id: PaymentId, txid: Txid, status: PaymentStatus) -> PaymentDetails {
+		PaymentDetails::new(
+			id,
+			PaymentKind::Onchain {
+				txid,
+				status: ConfirmationStatus::Unconfirmed,
+				tx_type: Some(TransactionType::InteractiveFunding { channels: Vec::new() }),
+			},
+			Some(1_000_000),
+			Some(500),
+			PaymentDirection::Outbound,
+			status,
+		)
+	}
+
+	#[tokio::test]
+	async fn classification_promotes_a_pre_broadcast_intent_record() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		let id = PaymentId([21u8; 32]);
+		let txid = Txid::from_byte_array([22u8; 32]);
+		wallet
+			.pending_payment_store
+			.insert(PendingPaymentDetails::pending_splice(id, test_splice_intent()))
+			.await
+			.unwrap();
+
+		let candidates = vec![FundingTxCandidate {
+			txid,
+			amount_msat: Some(1_000_000),
+			fee_paid_msat: Some(500),
+		}];
+		wallet
+			.persist_funding_payment(funding_payment(id, txid, PaymentStatus::Pending), candidates)
+			.await
+			.unwrap();
+
+		// The pre-broadcast record is promoted into the tracked funding payment, carrying its
+		// intent until the splice locks.
+		let record = wallet.pending_payment_store.get(&id).expect("the record must be promoted");
+		assert!(record.details().is_some());
+		assert!(record.splice_intent().is_some());
+	}
+
+	#[tokio::test]
+	async fn classification_removes_the_intent_record_of_an_advanced_payment() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		let id = PaymentId([23u8; 32]);
+		let txid = Txid::from_byte_array([24u8; 32]);
+		wallet
+			.pending_payment_store
+			.insert(PendingPaymentDetails::pending_splice(id, test_splice_intent()))
+			.await
+			.unwrap();
+		// Wallet sync confirmed the payment through `ANTI_REORG_DELAY` before classification ran:
+		// the payment graduated, so the record must not enter the pending store...
+		wallet
+			.payment_store
+			.insert(funding_payment(id, txid, PaymentStatus::Succeeded))
+			.await
+			.unwrap();
+
+		let candidates = vec![FundingTxCandidate {
+			txid,
+			amount_msat: Some(1_000_000),
+			fee_paid_msat: Some(500),
+		}];
+		wallet
+			.persist_funding_payment(funding_payment(id, txid, PaymentStatus::Pending), candidates)
+			.await
+			.unwrap();
+
+		// ...and the splice it would resubmit confirmed, so the leftover intent record is removed
+		// rather than left to resubmit the splice after a restart.
+		assert!(wallet.pending_payment_store.get(&id).is_none());
 	}
 
 	#[tokio::test]

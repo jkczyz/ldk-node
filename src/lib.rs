@@ -1782,18 +1782,18 @@ impl Node {
 				log_error!(self.logger, "Failed to splice channel: channel not yet ready");
 				Error::ChannelSplicingFailed
 			})?;
-			self.splice_retrier
-				.submit(
+			self.runtime
+				.block_on(self.splice_retrier.submit(
 					*user_channel_id,
 					counterparty_node_id,
 					channel_details.channel_id,
-					pre_splice_funding_txo.into_bitcoin_outpoint(),
+					pre_splice_funding_txo,
 					contribution,
 					SpliceKind::In { amount_sats: splice_amount_sats },
-				)
+				))
 				.map_err(|e| {
 					log_error!(self.logger, "Failed to splice channel: {:?}", e);
-					Error::ChannelSplicingFailed
+					e
 				})
 		} else {
 			log_error!(
@@ -1937,18 +1937,18 @@ impl Node {
 				log_error!(self.logger, "Failed to splice channel: channel not yet ready");
 				Error::ChannelSplicingFailed
 			})?;
-			self.splice_retrier
-				.submit(
+			self.runtime
+				.block_on(self.splice_retrier.submit(
 					*user_channel_id,
 					counterparty_node_id,
 					channel_details.channel_id,
-					pre_splice_funding_txo.into_bitcoin_outpoint(),
+					pre_splice_funding_txo,
 					contribution,
 					SpliceKind::Out { outputs },
-				)
+				))
 				.map_err(|e| {
 					log_error!(self.logger, "Failed to splice channel: {:?}", e);
-					Error::ChannelSplicingFailed
+					e
 				})
 		} else {
 			log_error!(
@@ -2020,18 +2020,18 @@ impl Node {
 				log_error!(self.logger, "Failed to RBF channel: channel not yet ready");
 				Error::ChannelSplicingFailed
 			})?;
-			self.splice_retrier
-				.submit(
+			self.runtime
+				.block_on(self.splice_retrier.submit(
 					*user_channel_id,
 					counterparty_node_id,
 					channel_details.channel_id,
-					pre_splice_funding_txo.into_bitcoin_outpoint(),
+					pre_splice_funding_txo,
 					contribution,
 					SpliceKind::Rbf {},
-				)
+				))
 				.map_err(|e| {
 					log_error!(self.logger, "Failed to RBF channel: {:?}", e);
-					Error::ChannelSplicingFailed
+					e
 				})
 		} else {
 			log_error!(
