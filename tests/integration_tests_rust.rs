@@ -2748,7 +2748,8 @@ async fn splice_in_rbf_joins_counterparty_splice() {
 
 /// A recoverable mid-negotiation failure is retried without surfacing to the user: the initiator
 /// disconnects while the interactive negotiation is in flight, LDK fails the splice with
-/// `PeerDisconnected`, and the retrier resubmits the same contribution once reconnected.
+/// `PeerDisconnected`, and the retrier rebuilds the contribution from the originating parameters
+/// and resubmits it once reconnected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn splice_retried_after_disconnect_mid_negotiation() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
@@ -2808,10 +2809,11 @@ async fn splice_retried_after_disconnect_mid_negotiation() {
 		.expect("node A never received splice_ack");
 	node_a.disconnect(node_b.node_id()).unwrap();
 
-	// ... which fails it with `PeerDisconnected` — recoverable, so the retrier resubmits the
-	// contribution instead of surfacing the failure. LDK queues the resubmission until reconnect.
+	// ... which fails it with `PeerDisconnected` — recoverable, and the originating parameters
+	// are available, so the retrier rebuilds the contribution and resubmits it instead of
+	// surfacing the failure. LDK queues the resubmission until reconnect.
 	assert!(
-		logger_a.wait_for("Resubmitting splice for channel").await,
+		logger_a.wait_for("Resubmitting a rebuilt splice contribution for channel").await,
 		"the failed splice was not resubmitted"
 	);
 
