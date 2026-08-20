@@ -30,30 +30,33 @@ use crate::Error;
 const MAX_SPLICE_ATTEMPTS: u8 = 3;
 
 /// The action to take on a `SpliceNegotiationFailed` for a splice we track, decided purely from
-/// the failure `reason` and the attempt count so the decision matrix can be unit-tested without a
-/// live channel.
+/// the failure `reason`, the attempt count, and whether the originating parameters are available,
+/// so the decision matrix can be unit-tested without a live channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RetryDecision {
 	/// Give up: stop tracking the splice and surface the failure to the user.
 	Abandon,
-	/// Resubmit the stored contribution unchanged (a transient failure such as a disconnect).
+	/// Resubmit the stored contribution unchanged (the originating parameters are unavailable, so
+	/// a fresh contribution cannot be built).
 	ResubmitStored,
-	/// Rebuild a fresh contribution from the original parameters (the stored one went stale).
+	/// Rebuild a fresh contribution from the originating parameters, picking up current fee rates
+	/// and wallet state.
 	Rebuild,
 }
 
-fn decide_retry(reason: &NegotiationFailureReason, attempts: u8) -> RetryDecision {
+fn decide_retry(
+	reason: &NegotiationFailureReason, attempts: u8, can_rebuild: bool,
+) -> RetryDecision {
 	if !reason.is_retriable() || attempts >= MAX_SPLICE_ATTEMPTS {
 		return RetryDecision::Abandon;
 	}
-	match reason {
-		// The stored contribution is still valid after a transient failure.
-		NegotiationFailureReason::PeerDisconnected | NegotiationFailureReason::Unknown => {
-			RetryDecision::ResubmitStored
-		},
-		// The remaining retriable reasons (`FeeRateTooLow`, `ContributionInvalid`) mean the stored
-		// contribution went stale.
-		_ => RetryDecision::Rebuild,
+	// Rebuilding picks up current fee rates and wallet state, so prefer it whenever the
+	// originating parameters are available. Only a splice adopted from a replayed event cannot be
+	// rebuilt; its stored contribution is resubmitted unchanged.
+	if can_rebuild {
+		RetryDecision::Rebuild
+	} else {
+		RetryDecision::ResubmitStored
 	}
 }
 
@@ -70,14 +73,14 @@ struct PendingSplice {
 	/// replacement) completed and there is nothing left to resubmit.
 	pre_splice_funding_txo: OutPoint,
 	/// The contribution handed to [`ChannelManager::funding_contributed`], resubmitted verbatim
-	/// after a transient failure.
+	/// when a fresh contribution cannot be built.
 	///
 	/// [`ChannelManager::funding_contributed`]: lightning::ln::channelmanager::ChannelManager::funding_contributed
 	contribution: FundingContribution,
-	/// The parameters of the originating API call, used to rebuild a fresh contribution when the
-	/// stored one has become stale. `None` for a splice adopted from a failure event LDK replayed
-	/// after a restart: its contribution can be resubmitted, but the originating parameters did
-	/// not survive the restart, so it cannot be rebuilt.
+	/// The parameters of the originating API call, used to rebuild a fresh contribution at retry
+	/// time. `None` for a splice adopted from a failure event LDK replayed after a restart: its
+	/// contribution can be resubmitted, but the originating parameters did not survive the
+	/// restart, so it cannot be rebuilt.
 	kind: Option<SpliceKind>,
 	/// The number of times the contribution has been resubmitted to LDK after the originating API
 	/// call handed it off.
@@ -136,7 +139,7 @@ fn classify_failure(
 			} else if splice.rejected {
 				FailureClass::Consume
 			} else {
-				FailureClass::Tracked(decide_retry(reason, splice.attempts))
+				FailureClass::Tracked(decide_retry(reason, splice.attempts, splice.kind.is_some()))
 			}
 		},
 		None => {
@@ -325,7 +328,8 @@ impl SpliceRetrier {
 						contribution,
 					) {
 						Some(splice) => {
-							let decision = decide_retry(&reason, splice.attempts);
+							let decision =
+								decide_retry(&reason, splice.attempts, splice.kind.is_some());
 							(splice, decision)
 						},
 						None => return true,
@@ -379,40 +383,37 @@ impl SpliceRetrier {
 				self.resubmit(user_channel_id, splice, None).await
 			},
 			RetryDecision::Rebuild => {
-				let Some(kind) = splice.kind.clone() else {
-					// Adopted from a replayed event: the originating parameters are gone, so a
-					// stale contribution cannot be rebuilt.
-					log_error!(
-						self.logger,
-						"Abandoning adopted splice for channel {}: its contribution went stale and \
-						the originating parameters did not survive the restart",
-						splice.channel_id,
-					);
-					return true;
-				};
-				match self
+				let kind = splice.kind.clone().expect(
+					"a rebuild is only decided when the originating parameters are available",
+				);
+				let rebuilt = match self
 					.rebuild_contribution(&splice.channel_id, &splice.counterparty_node_id, &kind)
 					.await
 				{
-					Ok(contribution) => {
-						log_info!(
-							self.logger,
-							"Resubmitting rebuilt splice for channel {} with counterparty {}",
-							splice.channel_id,
-							splice.counterparty_node_id,
-						);
-						self.resubmit(user_channel_id, splice, Some(contribution)).await
-					},
+					Ok(contribution) => Some(contribution),
 					Err(e) => {
+						// The wallet may no longer be able to fund a fresh contribution (or the
+						// channel may be gone, which the resubmission below then surfaces). The
+						// stored contribution is still worth handing back rather than giving up.
 						log_error!(
 							self.logger,
-							"Abandoning splice for channel {}: failed to rebuild contribution: {:?}",
+							"Failed to rebuild the splice contribution for channel {}, falling \
+							back to the stored one: {:?}",
 							splice.channel_id,
 							e,
 						);
-						true
+						None
 					},
-				}
+				};
+				log_info!(
+					self.logger,
+					"Resubmitting {} splice contribution for channel {} with counterparty {} after \
+					a recoverable failure",
+					if rebuilt.is_some() { "a rebuilt" } else { "the stored" },
+					splice.channel_id,
+					splice.counterparty_node_id,
+				);
+				self.resubmit(user_channel_id, splice, rebuilt).await
 			},
 		}
 	}
@@ -586,16 +587,23 @@ mod tests {
 	fn decide_retry_matrix() {
 		use NegotiationFailureReason::*;
 
-		// A non-retriable reason gives up regardless of attempts.
-		assert_eq!(decide_retry(&LocallyCanceled, 0), RetryDecision::Abandon);
+		// A non-retriable reason gives up regardless of attempts or available parameters.
+		assert_eq!(decide_retry(&LocallyCanceled, 0, true), RetryDecision::Abandon);
 		// Retriable, but the resubmission budget is exhausted -> give up.
-		assert_eq!(decide_retry(&PeerDisconnected, MAX_SPLICE_ATTEMPTS), RetryDecision::Abandon);
-		// Transient failures resubmit the stored contribution.
-		assert_eq!(decide_retry(&PeerDisconnected, 0), RetryDecision::ResubmitStored);
-		assert_eq!(decide_retry(&Unknown, MAX_SPLICE_ATTEMPTS - 1), RetryDecision::ResubmitStored);
-		// A stale contribution is rebuilt from the original parameters.
-		assert_eq!(decide_retry(&FeeRateTooLow, 0), RetryDecision::Rebuild);
-		assert_eq!(decide_retry(&ContributionInvalid, 0), RetryDecision::Rebuild);
+		assert_eq!(
+			decide_retry(&PeerDisconnected, MAX_SPLICE_ATTEMPTS, true),
+			RetryDecision::Abandon
+		);
+		// The originating parameters are available: rebuild at current fee rates.
+		assert_eq!(decide_retry(&PeerDisconnected, 0, true), RetryDecision::Rebuild);
+		assert_eq!(
+			decide_retry(&FeeRateTooLow, MAX_SPLICE_ATTEMPTS - 1, true),
+			RetryDecision::Rebuild
+		);
+		// No originating parameters (adopted from a replayed event): resubmitting the stored
+		// contribution is all that is possible.
+		assert_eq!(decide_retry(&Unknown, 0, false), RetryDecision::ResubmitStored);
+		assert_eq!(decide_retry(&ContributionInvalid, 0, false), RetryDecision::ResubmitStored);
 	}
 
 	fn test_splice(contribution: FundingContribution) -> PendingSplice {
@@ -620,9 +628,21 @@ mod tests {
 		let tracked = test_splice(test_funding_contribution());
 		let failed = tracked.contribution.clone();
 
-		// The tracked splice failed: the retry matrix decides.
+		// The tracked splice failed and its originating parameters are available: rebuild.
 		assert_eq!(
 			classify_failure(Some(&tracked), &PeerDisconnected, Some(&failed)),
+			FailureClass::Tracked(RetryDecision::Rebuild),
+		);
+		// A splice adopted from a replayed event has no originating parameters: resubmitting the
+		// stored contribution is all that is possible, whatever the retriable reason.
+		let mut adopted = tracked.clone();
+		adopted.kind = None;
+		assert_eq!(
+			classify_failure(Some(&adopted), &PeerDisconnected, Some(&failed)),
+			FailureClass::Tracked(RetryDecision::ResubmitStored),
+		);
+		assert_eq!(
+			classify_failure(Some(&adopted), &FeeRateTooLow, Some(&failed)),
 			FailureClass::Tracked(RetryDecision::ResubmitStored),
 		);
 		// The failure concerns some other attempt (a stale event replayed after a newer splice
@@ -709,7 +729,7 @@ mod tests {
 		assert_ne!(tracked.contribution, adjusted);
 		assert_eq!(
 			classify_failure(Some(&tracked), &PeerDisconnected, Some(&adjusted)),
-			FailureClass::Tracked(RetryDecision::ResubmitStored),
+			FailureClass::Tracked(RetryDecision::Rebuild),
 		);
 	}
 
