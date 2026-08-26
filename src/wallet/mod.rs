@@ -2734,7 +2734,7 @@ fn funding_reclassification_update(
 
 #[cfg(all(test, any(feature = "chain-esplora", feature = "chain-electrum")))]
 mod tests {
-	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 	use std::time::Duration;
 
 	use bdk_chain::{BlockId, ConfirmationBlockTime};
@@ -2764,11 +2764,13 @@ mod tests {
 	const EXTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/0/*)";
 	const INTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/1/*)";
 
-	/// An in-memory store whose writes can be made to fail on demand.
+	/// An in-memory store whose writes can be made to fail on demand, counting the failures so
+	/// tests can wait for a write to have actually failed rather than guessing with a sleep.
 	#[derive(Clone)]
 	struct FailSwitchStore {
 		inner: Arc<InMemoryStore>,
 		fail_writes: Arc<AtomicBool>,
+		failed_writes: Arc<AtomicUsize>,
 	}
 
 	impl FailSwitchStore {
@@ -2776,6 +2778,7 @@ mod tests {
 			Self {
 				inner: Arc::new(InMemoryStore::new()),
 				fail_writes: Arc::new(AtomicBool::new(false)),
+				failed_writes: Arc::new(AtomicUsize::new(0)),
 			}
 		}
 	}
@@ -2792,11 +2795,13 @@ mod tests {
 		) -> impl Future<Output = Result<(), io::Error>> + 'static + Send {
 			let inner = Arc::clone(&self.inner);
 			let fail_writes = Arc::clone(&self.fail_writes);
+			let failed_writes = Arc::clone(&self.failed_writes);
 			let primary_namespace = primary_namespace.to_string();
 			let secondary_namespace = secondary_namespace.to_string();
 			let key = key.to_string();
 			async move {
 				if fail_writes.load(Ordering::Acquire) {
+					failed_writes.fetch_add(1, Ordering::AcqRel);
 					return Err(io::Error::new(io::ErrorKind::Other, "writes disabled"));
 				}
 				KVStore::write(&*inner, &primary_namespace, &secondary_namespace, &key, buf).await
@@ -4293,17 +4298,27 @@ mod tests {
 			},
 		)]);
 
-		// Let the loop fail at least one classification round; a failed classification must not
-		// leave a partial record behind.
-		tokio::time::sleep(Duration::from_secs(3)).await;
-		assert!(wallet.payment_store.list_filter(|_| true).is_empty());
+		// Wait until the loop has actually failed a classification write; re-enabling writes
+		// before the first attempt would let the first attempt succeed and the test pass
+		// without any retry happening. A failed classification must not leave a partial
+		// record behind.
+		let mut failed_writes = 0;
+		for _ in 0..100 {
+			tokio::time::sleep(Duration::from_millis(100)).await;
+			failed_writes = fail_store.failed_writes.load(Ordering::Acquire);
+			if failed_writes > 0 {
+				break;
+			}
+		}
+		assert!(failed_writes > 0, "classification never attempted a payment-store write");
+		assert!(wallet.payment_store.list_page(None).await.unwrap().objects.is_empty());
 
 		// Once writes recover, the package must still be alive to classify.
 		fail_store.fail_writes.store(false, Ordering::Release);
 		let mut recorded = Vec::new();
 		for _ in 0..100 {
 			tokio::time::sleep(Duration::from_millis(100)).await;
-			recorded = wallet.payment_store.list_filter(|_| true);
+			recorded = wallet.payment_store.list_page(None).await.unwrap().objects;
 			if !recorded.is_empty() {
 				break;
 			}
