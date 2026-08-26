@@ -4337,6 +4337,88 @@ mod tests {
 		loop_task.await.unwrap();
 	}
 
+	/// A package awaiting a classification retry must die when the node stops. When the retry
+	/// was a detached task, it outlived the broadcast loop: its re-send into the still-open
+	/// queue succeeded after `stop()`, so a later `start()` would classify and broadcast the
+	/// stale package.
+	#[tokio::test]
+	async fn failed_classification_retry_dies_at_stop() {
+		use lightning::chain::chaininterface::BroadcasterInterface;
+
+		let fail_store = FailSwitchStore::new();
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(fail_store.clone()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+		wallet.broadcaster.set_wallet(Arc::downgrade(&wallet));
+
+		let (stop_sender, stop_receiver) = tokio::sync::watch::channel(());
+		let chain_source = Arc::clone(&wallet.chain_source);
+		let loop_task = tokio::spawn(async move {
+			chain_source.continuously_process_broadcast_queue(stop_receiver).await
+		});
+
+		let script_pubkey = wallet
+			.inner
+			.lock()
+			.unwrap()
+			.reveal_next_address(KeychainKind::External)
+			.address
+			.script_pubkey();
+		let tx = Transaction {
+			version: bitcoin::transaction::Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: Vec::new(),
+			output: vec![TxOut { value: Amount::from_sat(10_000), script_pubkey }],
+		};
+		let counterparty_node_id = PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.unwrap();
+
+		// Queue the broadcast while payment persistence is failing and wait for the loop to
+		// fail a classification attempt, leaving a retry pending.
+		fail_store.fail_writes.store(true, Ordering::Release);
+		wallet.broadcaster.broadcast_transactions(&[(
+			&tx,
+			LdkTransactionType::Funding {
+				channels: vec![(counterparty_node_id, ChannelId([7u8; 32]))],
+			},
+		)]);
+		let mut failed_writes = 0;
+		for _ in 0..100 {
+			tokio::time::sleep(Duration::from_millis(100)).await;
+			failed_writes = fail_store.failed_writes.load(Ordering::Acquire);
+			if failed_writes > 0 {
+				break;
+			}
+		}
+		assert!(failed_writes > 0, "classification never attempted a payment-store write");
+
+		// Stop the node with the retry still pending, then bring the loop back up with
+		// working persistence, as a stop()/start() cycle would.
+		stop_sender.send(()).unwrap();
+		loop_task.await.unwrap();
+		fail_store.fail_writes.store(false, Ordering::Release);
+
+		let (stop_sender, stop_receiver) = tokio::sync::watch::channel(());
+		let chain_source = Arc::clone(&wallet.chain_source);
+		let loop_task = tokio::spawn(async move {
+			chain_source.continuously_process_broadcast_queue(stop_receiver).await
+		});
+
+		// Watch well past the retry delay: the package from before the stop must not be
+		// classified or broadcast by the restarted loop.
+		for _ in 0..40 {
+			tokio::time::sleep(Duration::from_millis(100)).await;
+			assert!(
+				wallet.payment_store.list_page(None).await.unwrap().objects.is_empty(),
+				"a package from before stop() resurfaced after restart"
+			);
+		}
+
+		stop_sender.send(()).unwrap();
+		loop_task.await.unwrap();
+	}
+
 	/// Barrier test, classification-first ordering: wallet sync's confirmation handling must
 	/// wait for classification's two-store write pair. Classification is parked between its
 	/// payment-store and pending-store writes (the torn window) and only then is the
