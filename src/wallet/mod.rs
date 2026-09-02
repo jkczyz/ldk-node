@@ -4328,6 +4328,37 @@ mod tests {
 		assert!(wallet.payment_store.get(&id).await.unwrap().is_some());
 	}
 
+	/// The startup decision whether a locked funding consumed a lost splice's inputs — release
+	/// them or not — must only trust transactions the wallet has actually seen spending them.
+	#[tokio::test]
+	async fn tx_spends_outpoints_only_matches_known_spends() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		let spent = OutPoint { txid: Txid::from_byte_array([8u8; 32]), vout: 1 };
+		let other = OutPoint { txid: Txid::from_byte_array([9u8; 32]), vout: 0 };
+		let txid = {
+			let mut locked_wallet = wallet.inner.lock().unwrap();
+			// Pay the wallet itself so the transaction is one it keeps.
+			let script_pubkey =
+				locked_wallet.next_unused_address(KeychainKind::External).address.script_pubkey();
+			let tx = Transaction {
+				version: bitcoin::transaction::Version::TWO,
+				lock_time: bitcoin::absolute::LockTime::ZERO,
+				input: vec![bitcoin::TxIn { previous_output: spent, ..bitcoin::TxIn::default() }],
+				output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey }],
+			};
+			let txid = tx.compute_txid();
+			locked_wallet.apply_unconfirmed_txs([(tx, 1u64)]);
+			txid
+		};
+
+		assert!(wallet.tx_spends_outpoints(txid, &[spent, other]));
+		assert!(!wallet.tx_spends_outpoints(txid, &[other]));
+		// A transaction the wallet has never seen spends nothing, whatever the outpoints.
+		assert!(!wallet.tx_spends_outpoints(Txid::from_byte_array([7u8; 32]), &[spent]));
+	}
+
 	#[tokio::test]
 	async fn refill_publishes_addresses_only_after_their_reveal_is_persisted() {
 		let fail_store = FailSwitchStore::new();

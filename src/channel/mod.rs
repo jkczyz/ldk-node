@@ -15,12 +15,13 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::transaction::Version;
 use bitcoin::{OutPoint, Transaction, TxIn};
 use lightning::chain::transaction::OutPoint as LdkOutPoint;
+use lightning::ln::channel_state::{SpliceCandidateDetails, SpliceCandidateStatus};
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::funding::FundingContribution;
 use lightning::ln::types::ChannelId;
 
 use crate::data_store::StorableObject;
-use crate::logger::{log_error, LdkLogger, Logger};
+use crate::logger::{log_error, log_info, LdkLogger, Logger};
 use crate::payment::pending_payment_store::{
 	PendingPaymentDetails, PendingPaymentDetailsUpdate, SpliceIntent, SpliceKind,
 };
@@ -55,9 +56,9 @@ fn is_same_splice(a: &FundingContribution, b: &FundingContribution) -> bool {
 /// The intent is written before the contribution is handed to LDK, undone when LDK rejects the
 /// hand-off synchronously, and cleared once the splice locks, its failure is surfaced, or its
 /// channel closes. The record exists for recovery, not retry: a splice still recorded at the
-/// next startup identifies one that was in flight when the node stopped, so anything it reserved
-/// can be released, and events about the splice can be described in terms of the original
-/// request.
+/// next startup identifies one that was in flight when the node stopped, so [`Self::reconcile`]
+/// can release anything it still reserves, and events about the splice can be described in
+/// terms of the original request.
 pub(crate) struct SpliceTracker {
 	channel_manager: Arc<ChannelManager>,
 	wallet: Arc<Wallet>,
@@ -84,6 +85,89 @@ impl SpliceTracker {
 			payment_store,
 			submit_lock: tokio::sync::Mutex::new(()),
 			logger,
+		}
+	}
+
+	/// Reconciles the persisted splice intents against live channel state, releasing whatever the
+	/// wallet still holds for splices that did not survive the restart. LDK only persists a
+	/// splice once its negotiation reaches `AwaitingSignatures`, so a splice lost earlier leaves
+	/// no trace in LDK — the intent record is what recognizes the loss. Run once at startup,
+	/// before background chain syncing and event processing start, so nothing can act on the
+	/// stale reservations first.
+	///
+	/// Recovery is silent: no failure event is fabricated for a splice lost this way, since the
+	/// initiating call already returned and the channel simply shows no pending splice anymore.
+	pub(crate) async fn reconcile(&self) {
+		let records = self.pending_payment_store.list_filter(|p| p.splice_intent().is_some()).await;
+		for record in records {
+			let payment_id = record.id();
+			let Some(intent) = record.splice_intent().cloned() else {
+				continue;
+			};
+
+			let channel = self
+				.channel_manager
+				.list_channels_with_counterparty(&intent.counterparty_node_id)
+				.into_iter()
+				.find(|c| c.channel_id == intent.channel_id);
+			let Some(channel) = channel else {
+				// The channel is gone; there is nothing to splice anymore.
+				log_info!(
+					self.logger,
+					"Dropping the recorded splice of closed channel {} with counterparty {}",
+					intent.channel_id,
+					intent.counterparty_node_id,
+				);
+				self.release_contribution(intent.channel_id, &intent.contribution).await;
+				self.clear_persisted_intent(payment_id, |i| *i == intent).await;
+				continue;
+			};
+
+			if channel.funding_txo != Some(intent.pre_splice_funding_txo) {
+				// The funding moved on while the node was down: the recorded splice, a
+				// replacement, or a counterparty splice locked — the same situation a live lock
+				// event resolves, so resolve it the same way.
+				self.on_channel_ready(
+					intent.counterparty_node_id,
+					intent.channel_id,
+					channel.funding_txo.map(|txo| txo.into_bitcoin_outpoint()),
+				)
+				.await;
+				continue;
+			}
+
+			let candidates = channel
+				.splice_details
+				.as_ref()
+				.map(|details| details.candidates.as_slice())
+				.unwrap_or(&[]);
+			match decide_reconcile(candidates) {
+				ReconcileDecision::Keep => {
+					// A kept record may still reserve more than LDK's surviving rounds use —
+					// extras a fee bump lost with the restart had reserved. Release the
+					// difference.
+					let extras = unclaimed_inputs(&intent.contribution, candidates);
+					if let Err(e) = self.wallet.unlock_outpoints(&extras).await {
+						log_error!(
+							self.logger,
+							"Failed to release unused splice inputs on channel {}: {}",
+							intent.channel_id,
+							e,
+						);
+					}
+				},
+				ReconcileDecision::Lost => {
+					log_info!(
+						self.logger,
+						"Dropping a splice on channel {} with counterparty {} that did not survive \
+						the restart",
+						intent.channel_id,
+						intent.counterparty_node_id,
+					);
+					self.release_contribution(intent.channel_id, &intent.contribution).await;
+					self.clear_persisted_intent(payment_id, |i| *i == intent).await;
+				},
+			}
 		}
 	}
 
@@ -398,7 +482,8 @@ impl SpliceTracker {
 	/// Settles any persisted intent made obsolete by a newly locked funding transaction. An
 	/// intent whose pre-splice outpoint is the newly locked funding was created after the lock
 	/// and stays; one LDK still holds as a queued splice candidate is refreshed to the new
-	/// funding rather than settled.
+	/// funding rather than settled. Also resolves [`Self::reconcile`]'s case of a funding that
+	/// moved while the node was down — the same situation, minus the event.
 	pub(crate) async fn on_channel_ready(
 		&self, counterparty_node_id: PublicKey, channel_id: ChannelId,
 		funding_txo: Option<OutPoint>,
@@ -577,6 +662,61 @@ fn record_with_intent_cleared(
 	}
 }
 
+/// What [`SpliceTracker::reconcile`] should do with a persisted intent whose channel and funding
+/// are unchanged, decided from the splice rounds LDK reports on the channel.
+#[derive(Debug, PartialEq, Eq)]
+enum ReconcileDecision {
+	/// LDK still holds a splice of ours; leave the intent in place until the splice settles.
+	Keep,
+	/// LDK holds no splice of ours: the recorded splice died with the restart, so whatever was
+	/// reserved for it is released and the intent dropped.
+	Lost,
+}
+
+/// Decides the startup action for a persisted intent from the channel's [`SpliceDetails`]
+/// candidates.
+///
+/// [`SpliceDetails`]: lightning::ln::channel_state::SpliceDetails
+fn decide_reconcile(candidates: &[SpliceCandidateDetails]) -> ReconcileDecision {
+	// A round short of `Negotiated` is one LDK still drives on its own: only `AwaitingSignatures`
+	// survives a restart, and LDK resumes the signature exchange itself on reconnect.
+	let in_flight = candidates
+		.iter()
+		.any(|candidate| !matches!(candidate.status, SpliceCandidateStatus::Negotiated { .. }));
+	if in_flight {
+		return ReconcileDecision::Keep;
+	}
+
+	// LDK persists a splice once negotiated, so a negotiated candidate carrying a local
+	// contribution is a splice of ours LDK sees through to lock — even one negotiated at a
+	// different feerate than a recorded fee bump asked for. Without one, only counterparty
+	// rounds (or nothing) survived: the recorded splice is gone.
+	if candidates.iter().any(|candidate| candidate.contribution.is_some()) {
+		ReconcileDecision::Keep
+	} else {
+		ReconcileDecision::Lost
+	}
+}
+
+/// The inputs `contribution` reserved that no candidate's own contribution still claims — extras
+/// a splice attempt lost with the restart had reserved. A counterparty-only round carries no
+/// contribution and claims nothing.
+fn unclaimed_inputs(
+	contribution: &FundingContribution, candidates: &[SpliceCandidateDetails],
+) -> Vec<OutPoint> {
+	let claimed: Vec<OutPoint> = candidates
+		.iter()
+		.filter_map(|candidate| candidate.contribution.as_ref())
+		.flat_map(|contribution| contribution.inputs().iter().map(|input| input.outpoint()))
+		.collect();
+	contribution
+		.inputs()
+		.iter()
+		.map(|input| input.outpoint())
+		.filter(|outpoint| !claimed.contains(outpoint))
+		.collect()
+}
+
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
@@ -587,7 +727,7 @@ mod tests {
 	use super::*;
 	use crate::payment::pending_payment_store::{
 		test_funding_contribution, test_funding_contribution_with_feerate,
-		test_funding_contribution_with_outputs,
+		test_funding_contribution_with_inputs, test_funding_contribution_with_outputs,
 	};
 	use crate::payment::store::{ConfirmationStatus, PaymentKind};
 	use crate::payment::PaymentDirection;
@@ -691,5 +831,104 @@ mod tests {
 			&test_funding_contribution(),
 			&test_funding_contribution_with_feerate(500)
 		));
+	}
+
+	fn negotiated_candidate(contribution: Option<FundingContribution>) -> SpliceCandidateDetails {
+		SpliceCandidateDetails {
+			contribution,
+			status: SpliceCandidateStatus::Negotiated {
+				txid: Txid::from_byte_array([9u8; 32]),
+				new_channel_value_satoshis: 100_000,
+			},
+		}
+	}
+
+	/// A previous transaction with a P2WPKH output at index 0 for a contribution input to spend;
+	/// `seed` varies the output script, and with it the txid.
+	fn test_prevtx(seed: u8) -> Transaction {
+		use bitcoin::{ScriptBuf, TxOut, WPubkeyHash};
+
+		Transaction {
+			version: Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: vec![TxIn::default()],
+			output: vec![TxOut {
+				value: Amount::from_sat(10_000),
+				script_pubkey: ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([seed; 20])),
+			}],
+		}
+	}
+
+	/// While any round is short of `Negotiated`, LDK drives the splice itself; the intent stays
+	/// in place until the splice settles.
+	#[test]
+	fn reconcile_keeps_the_intent_while_ldk_drives_a_round() {
+		let in_flight = SpliceCandidateDetails {
+			contribution: Some(test_funding_contribution()),
+			status: SpliceCandidateStatus::AwaitingSignatures {
+				is_initiator: true,
+				funding_feerate_sat_per_1000_weight: 253,
+				new_channel_value_satoshis: 100_000,
+				txid: Txid::from_byte_array([9u8; 32]),
+			},
+		};
+		assert_eq!(decide_reconcile(&[in_flight]), ReconcileDecision::Keep);
+	}
+
+	/// A negotiated candidate carrying a local contribution is a splice LDK sees through to lock;
+	/// nothing was lost. This holds on zero-conf channels too, where the pre-splice funding
+	/// outpoint has not moved on yet.
+	#[test]
+	fn reconcile_trusts_a_negotiated_contribution() {
+		let negotiated = [negotiated_candidate(Some(test_funding_contribution()))];
+		assert_eq!(decide_reconcile(&negotiated), ReconcileDecision::Keep);
+	}
+
+	/// A fee bump that only survives as a candidate negotiated at a lower feerate than requested
+	/// is not lost: the recorded bump is moot, but the splice lives on and locks. The old
+	/// higher-feerate attempt's extra reservations are released through the input difference, not
+	/// by dropping the record.
+	#[test]
+	fn reconcile_keeps_a_bump_negotiated_at_a_lower_feerate() {
+		let lower = [negotiated_candidate(Some(test_funding_contribution_with_feerate(253)))];
+		assert_eq!(decide_reconcile(&lower), ReconcileDecision::Keep);
+	}
+
+	/// With no contribution of ours in LDK — no splice at all, or only a counterparty round — the
+	/// recorded splice died with the restart.
+	#[test]
+	fn reconcile_finds_the_splice_lost_when_ldk_holds_no_contribution() {
+		assert_eq!(decide_reconcile(&[]), ReconcileDecision::Lost);
+		let counterparty_only = [negotiated_candidate(None)];
+		assert_eq!(decide_reconcile(&counterparty_only), ReconcileDecision::Lost);
+	}
+
+	/// The inputs a kept record reserves beyond what LDK's candidates still claim are identified
+	/// for release; a counterparty-only round claims nothing and must not suppress the
+	/// difference.
+	#[test]
+	fn unclaimed_inputs_are_those_no_candidate_contribution_uses() {
+		let prevtxs: Vec<Transaction> = (1u8..=3).map(test_prevtx).collect();
+		let outpoint = |tx: &Transaction| OutPoint { txid: tx.compute_txid(), vout: 0 };
+		let recorded = test_funding_contribution_with_inputs(253, &prevtxs);
+
+		// Every input still claimed by a surviving candidate: nothing to release.
+		let all =
+			[negotiated_candidate(Some(test_funding_contribution_with_inputs(253, &prevtxs)))];
+		assert!(unclaimed_inputs(&recorded, &all).is_empty());
+
+		// A candidate claiming two of the three inputs: the third is released, even with a
+		// counterparty-only round alongside.
+		let partial = [
+			negotiated_candidate(None),
+			negotiated_candidate(Some(test_funding_contribution_with_inputs(253, &prevtxs[..2]))),
+		];
+		assert_eq!(unclaimed_inputs(&recorded, &partial), vec![outpoint(&prevtxs[2])]);
+
+		// No candidates at all: everything is released.
+		assert_eq!(
+			unclaimed_inputs(&recorded, &[]),
+			prevtxs.iter().map(outpoint).collect::<Vec<_>>()
+		);
 	}
 }

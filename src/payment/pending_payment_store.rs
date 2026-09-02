@@ -414,6 +414,44 @@ pub(crate) fn test_funding_contribution_with_outputs(
 		.expect("hand-built TLV stream must decode")
 }
 
+/// Like [`test_funding_contribution`], but with the given input-selection feerate in sat/kwu and
+/// an input spending output 0 — which must be P2WPKH — of each given previous transaction.
+#[cfg(test)]
+pub(crate) fn test_funding_contribution_with_inputs(
+	feerate: u64, prevtxs: &[bitcoin::Transaction],
+) -> FundingContribution {
+	use lightning::util::ser::{BigSize, Writeable};
+	use lightning::util::wallet_utils::ConfirmedUtxo;
+	let mut records = vec![
+		1, 8, 0, 0, 0, 0, 0, 0, 0, 0, // (1, estimated_fee: 0 sat)
+	];
+	if !prevtxs.is_empty() {
+		let mut input_bytes = Vec::new();
+		for prevtx in prevtxs {
+			ConfirmedUtxo::new_p2wpkh(prevtx.clone(), 0)
+				.expect("test prevtx output 0 must be P2WPKH")
+				.write(&mut input_bytes)
+				.expect("in-memory write must succeed");
+		}
+		records.push(3); // (3, inputs)
+		BigSize(input_bytes.len() as u64)
+			.write(&mut records)
+			.expect("in-memory write must succeed");
+		records.extend_from_slice(&input_bytes);
+	}
+	records.extend_from_slice(&[9, 8]); // (9, feerate)
+	records.extend_from_slice(&feerate.to_be_bytes());
+	records.extend_from_slice(&[11, 8]); // (11, max_feerate)
+	records.extend_from_slice(&feerate.to_be_bytes());
+	records.extend_from_slice(&[13, 1, 1]); // (13, is_splice: true)
+	let mut tlv_bytes = Vec::new();
+	// BigSize length prefix over the TLV records above.
+	BigSize(records.len() as u64).write(&mut tlv_bytes).expect("in-memory write must succeed");
+	tlv_bytes.extend(records);
+	lightning::util::ser::Readable::read(&mut &tlv_bytes[..])
+		.expect("hand-built TLV stream must decode")
+}
+
 #[cfg(test)]
 mod tests {
 	use bitcoin::hashes::Hash;
