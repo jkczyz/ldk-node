@@ -1097,6 +1097,51 @@ impl Wallet {
 		}
 	}
 
+	/// Flushes any staged wallet changes to the persister, providing an explicit durability point
+	/// for state that was staged rather than persisted where it was written.
+	pub(crate) async fn persist_staged(&self) -> Result<(), Error> {
+		let mut locked_persister = self.persister.lock().await;
+		let change_set = self.inner.lock().expect("lock").take_staged().unwrap_or_default();
+		locked_persister.persist_changeset(change_set).await.map_err(|e| {
+			log_error!(self.logger, "Failed to persist wallet: {}", e);
+			Error::PersistenceFailed
+		})
+	}
+
+	/// Releases the given outpoints from the wallet's locked set — making them available to coin
+	/// selection again — and persists the change. Outpoints that are not locked are left alone.
+	pub(crate) async fn unlock_outpoints(&self, outpoints: &[OutPoint]) -> Result<(), Error> {
+		if outpoints.is_empty() {
+			return Ok(());
+		}
+		let mut locked_persister = self.persister.lock().await;
+		let change_set = {
+			let mut locked_wallet = self.inner.lock().expect("lock");
+			for outpoint in outpoints {
+				locked_wallet.unlock_outpoint(*outpoint);
+			}
+			locked_wallet.take_staged().unwrap_or_default()
+		};
+		locked_persister.persist_changeset(change_set).await.map_err(|e| {
+			log_error!(self.logger, "Failed to persist wallet: {}", e);
+			Error::PersistenceFailed
+		})
+	}
+
+	/// Whether the wallet-known transaction `txid` spends any of `outpoints`. `false` for a
+	/// transaction the wallet has never seen.
+	pub(crate) fn tx_spends_outpoints(&self, txid: Txid, outpoints: &[OutPoint]) -> bool {
+		let locked_wallet = self.inner.lock().expect("lock");
+		locked_wallet.get_tx(txid).map_or(false, |wallet_tx| {
+			wallet_tx
+				.tx_node
+				.tx
+				.input
+				.iter()
+				.any(|input| outpoints.contains(&input.previous_output))
+		})
+	}
+
 	pub(crate) fn get_balances(
 		&self, total_anchor_channels_reserve_sats: u64,
 	) -> Result<(u64, u64), Error> {
@@ -2088,6 +2133,10 @@ impl Wallet {
 		// is ordered before the removal, which then also deletes anything inserted here. A
 		// status read taken before this write goes stale when graduation lands in between, and
 		// would re-index the graduated payment.
+		let mut leftover_intent_to_remove = None;
+		// The `move` closure would capture the `Option` by value, so hand it a reference; the
+		// borrow ends with the mutate's future, before the leftover is read below.
+		let leftover = &mut leftover_intent_to_remove;
 		let payment_store = Arc::clone(&self.payment_store);
 		self.pending_payment_store
 			.mutate_async(&id, move |existing| async move {
@@ -2119,12 +2168,11 @@ impl Wallet {
 					}),
 					// A user-initiated splice has a pre-broadcast `PendingSplice` intent under
 					// this id; carry its intent into the `Tracked` record so promotion does
-					// not drop it (nothing persists or consumes intents yet — that arrives
-					// with the follow-up that makes splice retries survive restarts). If the
-					// payment already advanced beyond `Pending` (wallet sync confirmed it
-					// through `ANTI_REORG_DELAY` first), it must not enter the pending store;
-					// the leftover intent record stays until that follow-up adds its clearing
-					// path.
+					// not drop it. If the payment already advanced beyond `Pending` (wallet
+					// sync confirmed it through `ANTI_REORG_DELAY` first), it must not enter
+					// the pending store — and the splice behind the intent confirmed, so the
+					// leftover record is removed below rather than left to look like a splice
+					// still in flight after a restart.
 					Some(PendingPaymentDetails::PendingSplice { intent, .. }) => {
 						if recorded.status == PaymentStatus::Pending && !stale {
 							Some(PendingPaymentDetails::tracked(
@@ -2134,6 +2182,7 @@ impl Wallet {
 								Some(intent),
 							))
 						} else {
+							*leftover = Some(intent);
 							None
 						}
 					},
@@ -2155,6 +2204,16 @@ impl Wallet {
 				})
 			})
 			.await?;
+		if let Some(intent) = leftover_intent_to_remove {
+			// Only remove the record while it still is the bare intent the closure saw: a splice
+			// entry point may have replaced the intent (a new attempt reuses the channel's record)
+			// in between, and that live intent must stay.
+			self.pending_payment_store
+				.remove_if(&id, |record| {
+					record.details().is_none() && record.splice_intent() == Some(&intent)
+				})
+				.await?;
+		}
 
 		// With the candidate history recorded, duplicates wallet sync created for rounds that were
 		// not yet candidates can be folded back into this record. Runs after both writes so the
@@ -2773,7 +2832,7 @@ fn aggregate_local_stakes(candidate: &FundingCandidate) -> LocalStakeAggregate {
 /// Generates a fresh funding-record [`PaymentId`] from the OS entropy source. A funding record's id
 /// carries no meaning beyond uniqueness: the record is found through its transaction history
 /// ([`Wallet::find_payment_by_txid`]), never re-derived from a txid.
-fn random_payment_id() -> PaymentId {
+pub(crate) fn random_payment_id() -> PaymentId {
 	let mut bytes = [0u8; 32];
 	getrandom::fill(&mut bytes).expect("getrandom failed");
 	PaymentId(bytes)
@@ -3465,6 +3524,109 @@ mod tests {
 
 	fn pooled_indices(wallet: &Wallet) -> Vec<u32> {
 		wallet.address_pool.lock().unwrap().available.iter().map(|(index, _)| *index).collect()
+	}
+
+	fn test_splice_intent() -> crate::payment::pending_payment_store::SpliceIntent {
+		use crate::payment::pending_payment_store::{SpliceIntent, SpliceKind};
+
+		SpliceIntent {
+			counterparty_node_id: PublicKey::from_str(
+				"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+			)
+			.unwrap(),
+			channel_id: ChannelId([13u8; 32]),
+			pre_splice_funding_txo: lightning::chain::transaction::OutPoint {
+				txid: Txid::from_byte_array([3u8; 32]),
+				index: 0,
+			},
+			contribution: crate::payment::pending_payment_store::test_funding_contribution(),
+			kind: SpliceKind::In { amount_sats: 10_000 },
+		}
+	}
+
+	fn funding_payment(id: PaymentId, txid: Txid, status: PaymentStatus) -> PaymentDetails {
+		PaymentDetails::new(
+			id,
+			PaymentKind::Onchain {
+				txid,
+				status: ConfirmationStatus::Unconfirmed,
+				tx_type: Some(TransactionType::InteractiveFunding { channels: Vec::new() }),
+			},
+			Some(1_000_000),
+			Some(500),
+			PaymentDirection::Outbound,
+			status,
+		)
+	}
+
+	#[tokio::test]
+	async fn classification_promotes_a_pre_broadcast_intent_record() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		let id = PaymentId([21u8; 32]);
+		let txid = Txid::from_byte_array([22u8; 32]);
+		wallet
+			.pending_payment_store
+			.insert(PendingPaymentDetails::pending_splice(id, test_splice_intent()))
+			.await
+			.unwrap();
+
+		let candidates = vec![FundingTxCandidate {
+			txid,
+			amount_msat: Some(1_000_000),
+			fee_paid_msat: Some(500),
+		}];
+		wallet
+			.persist_funding_payment(funding_payment(id, txid, PaymentStatus::Pending), candidates)
+			.await
+			.unwrap();
+
+		// The pre-broadcast record is promoted into the tracked funding payment, carrying its
+		// intent until the splice locks.
+		let record = wallet
+			.pending_payment_store
+			.get(&id)
+			.await
+			.unwrap()
+			.expect("the record must be promoted");
+		assert!(record.details().is_some());
+		assert!(record.splice_intent().is_some());
+	}
+
+	#[tokio::test]
+	async fn classification_removes_the_intent_record_of_an_advanced_payment() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		let id = PaymentId([23u8; 32]);
+		let txid = Txid::from_byte_array([24u8; 32]);
+		wallet
+			.pending_payment_store
+			.insert(PendingPaymentDetails::pending_splice(id, test_splice_intent()))
+			.await
+			.unwrap();
+		// Wallet sync confirmed the payment through `ANTI_REORG_DELAY` before classification ran:
+		// the payment graduated, so the record must not enter the pending store...
+		wallet
+			.payment_store
+			.insert(funding_payment(id, txid, PaymentStatus::Succeeded))
+			.await
+			.unwrap();
+
+		let candidates = vec![FundingTxCandidate {
+			txid,
+			amount_msat: Some(1_000_000),
+			fee_paid_msat: Some(500),
+		}];
+		wallet
+			.persist_funding_payment(funding_payment(id, txid, PaymentStatus::Pending), candidates)
+			.await
+			.unwrap();
+
+		// ...and the splice behind the intent confirmed, so the leftover intent record is removed
+		// rather than left to look like a splice still in flight after a restart.
+		assert!(wallet.pending_payment_store.get(&id).await.unwrap().is_none());
 	}
 
 	#[tokio::test]

@@ -119,10 +119,11 @@ pub(crate) enum PendingPaymentDetails {
 	///
 	/// Each field is written by a different subsystem: wallet sync records `conflicting_txids`
 	/// for any wallet transaction (splice fundings included), broadcast-time classification
-	/// records `candidates` for interactive funding, and `splice_intent` is carried over from a
-	/// [`PendingSplice`] record when the payment is promoted — nothing persists an intent at
-	/// splice initiation yet; that lands with the splice tracking built on this. A splice uses
-	/// all of them; the fields do not partition by payment type.
+	/// records `candidates` for interactive funding, and `splice_intent` is owned by the splice
+	/// entry points and the splice tracker — persisted at splice initiation, carried over from a
+	/// [`PendingSplice`] record when the payment is promoted, and cleared once the splice locks
+	/// or its failure is surfaced. A splice uses all of them; the fields do not partition by
+	/// payment type.
 	///
 	/// [`PendingSplice`]: Self::PendingSplice
 	Tracked {
@@ -161,6 +162,10 @@ impl PendingPaymentDetails {
 		splice_intent: Option<SpliceIntent>,
 	) -> Self {
 		Self::Tracked { details, conflicting_txids, candidates, splice_intent }
+	}
+
+	pub(crate) fn pending_splice(id: PaymentId, intent: SpliceIntent) -> Self {
+		Self::PendingSplice { id, intent }
 	}
 
 	/// The full payment details, or `None` for a splice not yet broadcast.
@@ -329,12 +334,17 @@ impl From<&PendingPaymentDetails> for PendingPaymentDetailsUpdate {
 				} else {
 					Some(conflicting_txids.clone())
 				};
+				// Leave the splice intent unchanged: it is owned by the splice entry points and the
+				// splice tracker, never by a payment-tracking merge. Emitting the current value here
+				// would let an `insert_or_update` of a payment record (e.g. from wallet sync, built
+				// without an intent) clobber a live intent to `None`.
+				let _ = splice_intent;
 				Self {
 					id: details.id,
 					payment_update: Some(details.to_update()),
 					conflicting_txids,
 					candidates: candidates.clone(),
-					splice_intent: Some(splice_intent.clone()),
+					splice_intent: None,
 				}
 			},
 		}
@@ -361,6 +371,37 @@ pub(crate) fn test_funding_contribution_with_feerate(feerate: u64) -> FundingCon
 	tlv_bytes.extend_from_slice(&[11, 8]); // (11, max_feerate)
 	tlv_bytes.extend_from_slice(&feerate.to_be_bytes());
 	tlv_bytes.extend_from_slice(&[13, 1, 1]); // (13, is_splice: true)
+	lightning::util::ser::Readable::read(&mut &tlv_bytes[..])
+		.expect("hand-built TLV stream must decode")
+}
+
+/// Like [`test_funding_contribution`], but with the given input-selection feerate in sat/kwu and
+/// the given contributed outputs.
+#[cfg(test)]
+pub(crate) fn test_funding_contribution_with_outputs(
+	feerate: u64, outputs: &[bitcoin::TxOut],
+) -> FundingContribution {
+	use lightning::util::ser::Writeable;
+	let mut records = vec![
+		1, 8, 0, 0, 0, 0, 0, 0, 0, 0, // (1, estimated_fee: 0 sat)
+	];
+	if !outputs.is_empty() {
+		let mut output_bytes = Vec::new();
+		for output in outputs {
+			output.write(&mut output_bytes).expect("in-memory write must succeed");
+		}
+		records.push(5); // (5, outputs)
+		records.push(u8::try_from(output_bytes.len()).expect("test outputs must stay small"));
+		records.extend_from_slice(&output_bytes);
+	}
+	records.extend_from_slice(&[9, 8]); // (9, feerate)
+	records.extend_from_slice(&feerate.to_be_bytes());
+	records.extend_from_slice(&[11, 8]); // (11, max_feerate)
+	records.extend_from_slice(&feerate.to_be_bytes());
+	records.extend_from_slice(&[13, 1, 1]); // (13, is_splice: true)
+										 // BigSize length prefix over the TLV records above; single-byte as long as they stay short.
+	let mut tlv_bytes = vec![u8::try_from(records.len()).expect("test TLV stream must stay small")];
+	tlv_bytes.extend(records);
 	lightning::util::ser::Readable::read(&mut &tlv_bytes[..])
 		.expect("hand-built TLV stream must decode")
 }
@@ -591,6 +632,44 @@ mod tests {
 		assert_eq!(merged.candidate(txid), Some(&candidates[0]));
 		assert_eq!(merged_details.amount_msat, Some(1_000));
 		assert_eq!(merged_details.fee_paid_msat, Some(100));
+	}
+
+	fn test_intent() -> SpliceIntent {
+		use std::str::FromStr;
+
+		SpliceIntent {
+			counterparty_node_id: PublicKey::from_str(
+				"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+			)
+			.unwrap(),
+			channel_id: ChannelId([11u8; 32]),
+			pre_splice_funding_txo: OutPoint { txid: test_txid(12), index: 0 },
+			contribution: test_funding_contribution(),
+			kind: SpliceKind::In { amount_sats: 500_000 },
+		}
+	}
+
+	#[test]
+	fn payment_tracking_merge_preserves_a_live_splice_intent() {
+		let payment_id = PaymentId([7u8; 32]);
+		let txid = test_txid(8);
+		let intent = test_intent();
+		let mut record = PendingPaymentDetails::tracked(
+			pending_onchain_payment(payment_id, txid),
+			Vec::new(),
+			Vec::new(),
+			Some(intent.clone()),
+		);
+
+		// Wallet sync merges its view of a transaction through `to_update()` of a fresh record,
+		// which is built without an intent; the merge must leave the live intent in place.
+		let fresh = PendingPaymentDetails::new(
+			pending_onchain_payment(payment_id, txid),
+			vec![test_txid(9)],
+			Vec::new(),
+		);
+		assert!(record.update(fresh.to_update()));
+		assert_eq!(record.splice_intent(), Some(&intent));
 	}
 
 	#[test]
