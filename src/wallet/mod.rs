@@ -1831,11 +1831,22 @@ impl Wallet {
 				// The record was written above and payment records are never removed, so absence
 				// means the write failed out; fall back to the fresh details.
 				let recorded = payment_store.get(&id).await?.unwrap_or(details);
+				// A candidate history that lacks the record's current txid is stale — a queued
+				// classification retrying after a newer round classified. The merge arm below
+				// refuses such a history; recreating a missing entry from it would smuggle it
+				// past that refusal, so leave the recreation to a fresh classification (the
+				// newer round's own write, or its retry) instead.
+				let stale = match &recorded.kind {
+					PaymentKind::Onchain { txid, .. } if !candidates.is_empty() => {
+						!candidates.iter().any(|c| c.txid == *txid)
+					},
+					_ => false,
+				};
 				Ok(match existing {
 					// The inserted entry embeds the post-write record rather than the fresh
 					// details, so a confirmation wallet sync already recorded keeps driving
 					// graduation.
-					None if recorded.status == PaymentStatus::Pending => {
+					None if recorded.status == PaymentStatus::Pending && !stale => {
 						Some(PendingPaymentDetails::new(recorded, Vec::new(), candidates))
 					},
 					// The payment already advanced beyond Pending: the graduation path removed
@@ -2712,6 +2723,29 @@ fn funding_reclassification_update(
 	) = (current.map(|payment| &payment.kind), &details.kind)
 	{
 		return PaymentDetailsUpdate::new(details.id);
+	}
+
+	// An interactive-funding classification carries the full candidate history as of its own
+	// broadcast, and once a record is funding-classified its txid only ever names a candidate
+	// from that history. A classification whose history lacks such a record's current txid was
+	// therefore built before that candidate existed — a queued retry running after a newer round
+	// classified. Applying it would rotate the record backwards; the newer round's
+	// classification already recorded everything this one knows. A record that is not yet
+	// funding-classified gives no such signal — wallet sync can have rotated its txid to a
+	// conflicting transaction that is no candidate at all — so its first classification must
+	// still land.
+	if !candidates.is_empty() {
+		if let Some(PaymentKind::Onchain {
+			txid: current_txid,
+			tx_type:
+				Some(TransactionType::Funding { .. } | TransactionType::InteractiveFunding { .. }),
+			..
+		}) = current.map(|payment| &payment.kind)
+		{
+			if !candidates.iter().any(|c| c.txid == *current_txid) {
+				return PaymentDetailsUpdate::new(details.id);
+			}
+		}
 	}
 
 	let mut update = PaymentDetailsUpdate::funding_reclassification(details);
@@ -3807,12 +3841,20 @@ mod tests {
 
 	#[test]
 	fn funding_reclassification_update_keeps_the_active_candidate() {
+		let prior_txid = Txid::from_byte_array([1u8; 32]);
 		let active_txid = Txid::from_byte_array([2u8; 32]);
-		let candidates = vec![FundingTxCandidate {
-			txid: active_txid,
-			amount_msat: Some(1_000_000),
-			fee_paid_msat: Some(500),
-		}];
+		let candidates = vec![
+			FundingTxCandidate {
+				txid: prior_txid,
+				amount_msat: Some(1_000_000),
+				fee_paid_msat: Some(400),
+			},
+			FundingTxCandidate {
+				txid: active_txid,
+				amount_msat: Some(1_000_000),
+				fee_paid_msat: Some(500),
+			},
+		];
 		let details = onchain_details(active_txid, ConfirmationStatus::Unconfirmed);
 
 		// No record yet: the update describes the active candidate.
@@ -3820,25 +3862,79 @@ mod tests {
 		assert_eq!(update.txid, Some(active_txid));
 		assert_eq!(update.amount_msat, Some(Some(1_000_000)));
 
-		// An unconfirmed record: still the active candidate (RBF rotation).
-		let unconfirmed =
-			onchain_details(Txid::from_byte_array([1u8; 32]), ConfirmationStatus::Unconfirmed);
+		// An unconfirmed record on the prior candidate: rotate to the active one (RBF).
+		let unconfirmed = onchain_details(prior_txid, ConfirmationStatus::Unconfirmed);
 		let update =
 			funding_reclassification_update(details.clone(), &candidates, Some(&unconfirmed));
 		assert_eq!(update.txid, Some(active_txid));
 
 		// The record confirmed the active candidate itself: nothing to substitute.
 		let current = onchain_details(active_txid, confirmed_status());
-		let update = funding_reclassification_update(details.clone(), &candidates, Some(&current));
+		let update = funding_reclassification_update(details, &candidates, Some(&current));
 		assert_eq!(update.txid, Some(active_txid));
 		assert_eq!(update.amount_msat, Some(Some(1_000_000)));
+	}
 
-		// A confirmed txid outside the candidate history (e.g. the record is an unrelated
-		// same-id payment): fall back to the active candidate; `PaymentDetails::update` keeps
-		// the confirmed figures in place on mismatch.
-		let foreign = onchain_details(Txid::from_byte_array([9u8; 32]), confirmed_status());
-		let update = funding_reclassification_update(details, &candidates, Some(&foreign));
-		assert_eq!(update.txid, Some(active_txid));
+	/// A classification whose candidate history lacks a funding-classified record's current txid
+	/// was built before that candidate existed — a queued retry running after a newer round
+	/// classified — and must move nothing, whatever the record's confirmation state. A record
+	/// that is not yet funding-classified gives no such signal (wallet sync can have rotated its
+	/// txid to a conflicting non-candidate), so its first classification must still land.
+	#[test]
+	fn funding_reclassification_update_refuses_a_stale_candidate_history() {
+		let stale_txid = Txid::from_byte_array([1u8; 32]);
+		let newer_txid = Txid::from_byte_array([2u8; 32]);
+		let payment_id = PaymentId(stale_txid.to_byte_array());
+		let stale_history = vec![FundingTxCandidate {
+			txid: stale_txid,
+			amount_msat: Some(1_000_000),
+			fee_paid_msat: Some(400),
+		}];
+		let details =
+			interactive_funding_details(payment_id, stale_txid, Some(1_000_000), Some(400));
+
+		// The record moved on to a newer candidate while this classification was queued.
+		let unconfirmed =
+			interactive_funding_details(payment_id, newer_txid, Some(1_000_000), Some(500));
+		let update =
+			funding_reclassification_update(details.clone(), &stale_history, Some(&unconfirmed));
+		let mut updated = unconfirmed.clone();
+		assert!(!updated.update(update), "a stale retry must not move an unconfirmed record");
+		assert_eq!(updated, unconfirmed);
+
+		// Same when the newer candidate has already confirmed.
+		let mut confirmed = unconfirmed.clone();
+		confirmed.kind = PaymentKind::Onchain {
+			txid: newer_txid,
+			status: confirmed_status(),
+			tx_type: Some(TransactionType::InteractiveFunding { channels: vec![] }),
+		};
+		let update =
+			funding_reclassification_update(details.clone(), &stale_history, Some(&confirmed));
+		let mut updated = confirmed.clone();
+		assert!(!updated.update(update), "a stale retry must not move a confirmed record");
+		assert_eq!(updated, confirmed);
+
+		// A record that was never funding-classified: wallet sync rotated its txid to a
+		// conflicting transaction, which is no candidate. Its first classification is not stale
+		// and must land.
+		let mut unclassified =
+			interactive_funding_details(payment_id, newer_txid, Some(1_000_000), Some(500));
+		unclassified.kind = PaymentKind::Onchain {
+			txid: newer_txid,
+			status: ConfirmationStatus::Unconfirmed,
+			tx_type: None,
+		};
+		let update = funding_reclassification_update(details, &stale_history, Some(&unclassified));
+		let mut updated = unclassified.clone();
+		assert!(updated.update(update), "a first classification must not be treated as stale");
+		match &updated.kind {
+			PaymentKind::Onchain { txid, tx_type, .. } => {
+				assert_eq!(*txid, stale_txid);
+				assert!(matches!(tx_type, Some(TransactionType::InteractiveFunding { .. })));
+			},
+			kind => panic!("unexpected kind {:?}", kind),
+		}
 	}
 
 	/// A funding-typed (re)classification of a record already classified as interactive funding
@@ -4417,6 +4513,109 @@ mod tests {
 
 		stop_sender.send(()).unwrap();
 		loop_task.await.unwrap();
+	}
+
+	/// A queued classification can retry after a newer candidate of the same funding already
+	/// classified: the retry carries the candidate history as of its own broadcast, which no
+	/// longer includes the newer candidate. Applying it would rotate the record's txid backwards
+	/// and shrink the stored candidate history, after which the newer transaction can no longer
+	/// be mapped back to the record and wallet sync would file it as a foreign duplicate.
+	#[tokio::test]
+	async fn stale_classification_retry_keeps_the_newer_candidate() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+
+		let txid_a = Txid::from_byte_array([1u8; 32]);
+		let txid_b = Txid::from_byte_array([2u8; 32]);
+		// The record's id is anchored to the first negotiated candidate, so the stale retry
+		// resolves to the same record.
+		let payment_id = PaymentId(txid_a.to_byte_array());
+		let candidate_a = FundingTxCandidate {
+			txid: txid_a,
+			amount_msat: Some(1_000_000),
+			fee_paid_msat: Some(500),
+		};
+		let candidate_b = FundingTxCandidate {
+			txid: txid_b,
+			amount_msat: Some(1_000_000),
+			fee_paid_msat: Some(999),
+		};
+
+		// The bump candidate B classifies first, carrying the full history [A, B].
+		let fresh = interactive_funding_details(payment_id, txid_b, Some(1_000_000), Some(999));
+		wallet
+			.persist_funding_payment(fresh, vec![candidate_a.clone(), candidate_b.clone()])
+			.await
+			.unwrap();
+
+		// The queued classification of A retries, carrying the history as of A's broadcast.
+		let stale = interactive_funding_details(payment_id, txid_a, Some(1_000_000), Some(500));
+		wallet.persist_funding_payment(stale, vec![candidate_a.clone()]).await.unwrap();
+
+		let record = wallet.payment_store.get(&payment_id).await.unwrap().unwrap();
+		match &record.kind {
+			PaymentKind::Onchain { txid, .. } => {
+				assert_eq!(*txid, txid_b, "the stale retry must not rotate the record back");
+			},
+			kind => panic!("unexpected kind {:?}", kind),
+		}
+		assert_eq!(record.fee_paid_msat, Some(999));
+
+		let pending = wallet.pending_payment_store.get(&payment_id).await.unwrap().unwrap();
+		assert_eq!(
+			pending.candidates,
+			vec![candidate_a, candidate_b],
+			"the stale retry must not shrink the candidate history"
+		);
+
+		// The consequence the history protects against: B must stay mapped to the record, or
+		// wallet sync would file it as a foreign duplicate.
+		assert_eq!(wallet.find_payment_by_txid(txid_b).await.unwrap(), Some(payment_id));
+	}
+
+	/// A missing pending entry is normally recreated from the incoming classification — but not
+	/// from a stale retry, whose truncated candidate history would otherwise slip past the merge
+	/// path's refusal. Recreation is left to a fresh classification instead.
+	#[tokio::test]
+	async fn stale_classification_retry_does_not_recreate_the_pending_entry() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+
+		let txid_a = Txid::from_byte_array([1u8; 32]);
+		let txid_b = Txid::from_byte_array([2u8; 32]);
+		let payment_id = PaymentId(txid_a.to_byte_array());
+		let candidate_a = FundingTxCandidate {
+			txid: txid_a,
+			amount_msat: Some(1_000_000),
+			fee_paid_msat: Some(500),
+		};
+		let candidate_b = FundingTxCandidate {
+			txid: txid_b,
+			amount_msat: Some(1_000_000),
+			fee_paid_msat: Some(999),
+		};
+
+		// The newer round B classified, but its write pair was torn by the same store failure
+		// that queued this retry: the record exists, the pending entry does not.
+		let recorded = interactive_funding_details(payment_id, txid_b, Some(1_000_000), Some(999));
+		wallet.payment_store.insert(recorded).await.unwrap();
+
+		// The queued classification of A retries with its pre-B history.
+		let stale = interactive_funding_details(payment_id, txid_a, Some(1_000_000), Some(500));
+		wallet.persist_funding_payment(stale, vec![candidate_a.clone()]).await.unwrap();
+		assert!(
+			wallet.pending_payment_store.get(&payment_id).await.unwrap().is_none(),
+			"a stale retry must not recreate the pending entry from its truncated history"
+		);
+
+		// B's own retry recreates the entry with the full history.
+		let fresh = interactive_funding_details(payment_id, txid_b, Some(1_000_000), Some(999));
+		wallet
+			.persist_funding_payment(fresh, vec![candidate_a.clone(), candidate_b.clone()])
+			.await
+			.unwrap();
+		let pending = wallet.pending_payment_store.get(&payment_id).await.unwrap().unwrap();
+		assert_eq!(pending.candidates, vec![candidate_a, candidate_b]);
 	}
 
 	/// Barrier test, classification-first ordering: wallet sync's confirmation handling must
