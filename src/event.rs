@@ -2160,6 +2160,29 @@ where
 				..
 			} => match self.wallet.sign_owned_inputs(unsigned_transaction) {
 				Ok(partially_signed_tx) => {
+					// Record the splice's funding payment before handing our signatures to LDK:
+					// `funding_transaction_signed` releases them to the counterparty, after which
+					// either party may broadcast — and wallet sync could observe the transaction
+					// before its broadcast-time classification records it. On a failed write,
+					// replay rather than proceed unrecorded: LDK re-offers the event in-session
+					// and regenerates it across restarts while the transaction is unsigned.
+					if let Err(e) = self
+						.splice_tracker
+						.on_funding_ready_for_signing(
+							counterparty_node_id,
+							channel_id,
+							&partially_signed_tx,
+						)
+						.await
+					{
+						log_error!(
+							self.logger,
+							"Failed to record the splice funding payment for channel {}: {}",
+							channel_id,
+							e,
+						);
+						return Err(ReplayEvent());
+					}
 					match self.channel_manager.funding_transaction_signed(
 						&channel_id,
 						&counterparty_node_id,

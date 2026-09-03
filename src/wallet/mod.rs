@@ -63,7 +63,7 @@ use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger
 use crate::payment::pending_payment_store::PendingPaymentDetailsUpdate;
 use crate::payment::store::{ConfirmationStatus, PaymentDetailsUpdate};
 use crate::payment::{
-	FundingTxCandidate, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
+	Channel, FundingTxCandidate, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
 	PendingPaymentDetails, TransactionType,
 };
 use crate::runtime::Runtime;
@@ -1883,17 +1883,13 @@ impl Wallet {
 			}
 		}
 
-		let details = PaymentDetails::new(
+		let details = pending_funding_details(
 			payment_id,
-			PaymentKind::Onchain {
-				txid,
-				status: ConfirmationStatus::Unconfirmed,
-				tx_type: Some(tx_type),
-			},
+			txid,
+			tx_type,
 			amount_msat,
 			fee_paid_msat,
 			direction,
-			PaymentStatus::Pending,
 		);
 		self.persist_funding_payment_locked(&guard, details, Vec::new()).await?;
 		log_debug!(
@@ -1907,21 +1903,34 @@ impl Wallet {
 
 	/// Returns the `PaymentId` of a user-initiated splice intent for one of the channels in
 	/// `candidate`, if any, so a classified splice adopts the id chosen at splice time rather than
-	/// deriving one from the first candidate's txid. A fee bump reuses the channel's existing intent,
-	/// so at most one in-flight intent matches and the first is unambiguous.
+	/// deriving one from the first candidate's txid.
 	async fn find_splice_payment_id(&self, candidate: &FundingCandidate) -> Option<PaymentId> {
+		for channel in &candidate.channels {
+			let record =
+				self.find_splice_record(channel.counterparty_node_id, channel.channel_id).await;
+			if let Some(record) = record {
+				return Some(record.id());
+			}
+		}
+		None
+	}
+
+	/// Returns the pending record carrying a splice intent for the given channel, if any. A fee
+	/// bump reuses the channel's existing intent, so at most one in-flight intent matches and the
+	/// first is unambiguous.
+	async fn find_splice_record(
+		&self, counterparty_node_id: PublicKey, channel_id: ChannelId,
+	) -> Option<PendingPaymentDetails> {
 		self.pending_payment_store
 			.list_filter(|p| {
 				p.splice_intent().is_some_and(|intent| {
-					candidate.channels.iter().any(|channel| {
-						channel.channel_id == intent.channel_id
-							&& channel.counterparty_node_id == intent.counterparty_node_id
-					})
+					intent.channel_id == channel_id
+						&& intent.counterparty_node_id == counterparty_node_id
 				})
 			})
 			.await
-			.first()
-			.map(|p| p.id())
+			.into_iter()
+			.next()
 	}
 
 	/// Records an interactive-funding broadcast (splice, or a V2 dual-funded open) as a pending
@@ -2009,17 +2018,13 @@ impl Wallet {
 			})
 			.collect();
 
-		let details = PaymentDetails::new(
+		let details = pending_funding_details(
 			payment_id,
-			PaymentKind::Onchain {
-				txid,
-				status: ConfirmationStatus::Unconfirmed,
-				tx_type: Some(tx_type),
-			},
+			txid,
+			tx_type,
 			amount_msat,
 			fee_paid_msat,
 			direction,
-			PaymentStatus::Pending,
 		);
 		self.persist_funding_payment_locked(&guard, details, candidate_records).await?;
 		log_debug!(
@@ -2028,6 +2033,118 @@ impl Wallet {
 			txid,
 			candidates.len(),
 			active.channels.len(),
+		);
+		Ok(())
+	}
+
+	/// Records a splice funding transaction as a payment at signing time, before
+	/// [`ChannelManager::funding_transaction_signed`] can release this node's signatures: the
+	/// counterparty cannot broadcast a splice until it holds our `tx_signatures`, so a record
+	/// written here durably precedes any observation of the transaction. Wallet sync resolves
+	/// whichever party's broadcast it sees to this record instead of creating one of its own,
+	/// closing the window where sync outruns broadcast-time classification — which still runs and
+	/// converges on this record: it resolves the same intent (or a candidate txid), and its full
+	/// candidate list extends the one recorded here.
+	///
+	/// The candidate's figures come from the intent's stored contribution when it matches the
+	/// transaction being signed, falling back to the wallet's view of the transaction (e.g. when
+	/// a fee bump already replaced the intent while an earlier round's signing event was being
+	/// replayed). Transactions with no splice intent (nothing this node initiated) or no
+	/// wallet-level activity (e.g. a splice-out to an external address, which wallet sync cannot
+	/// observe either) are left to broadcast-time classification.
+	///
+	/// [`ChannelManager::funding_transaction_signed`]: lightning::ln::channelmanager::ChannelManager::funding_transaction_signed
+	pub(crate) async fn record_signed_funding(
+		&self, counterparty_node_id: PublicKey, channel_id: ChannelId, tx: &Transaction,
+	) -> Result<(), Error> {
+		let txid = tx.compute_txid();
+
+		// Same participation rule as `classify_interactive_funding`: a transaction that moves no
+		// wallet funds has nothing to record — and nothing wallet sync could race to observe.
+		let (wallet_amount_msat, wallet_fee_msat, wallet_direction) =
+			self.onchain_payment_fields(tx);
+		if wallet_amount_msat == Some(0) {
+			log_trace!(
+				self.logger,
+				"Not recording signed funding {} as a payment: no wallet-level activity",
+				txid,
+			);
+			return Ok(());
+		}
+
+		// Resolution and the write below must share one lock acquisition, as in classification:
+		// resolved outside it, the record could change under us before the write.
+		let guard = self.funding_payment_update_lock.lock().await;
+
+		let record = match self.find_splice_record(counterparty_node_id, channel_id).await {
+			Some(record) => record,
+			None => {
+				log_trace!(
+					self.logger,
+					"No splice intent for channel {}: leaving funding {} to broadcast classification",
+					channel_id,
+					txid,
+				);
+				return Ok(());
+			},
+		};
+		// A replayed signing event re-offers a transaction already recorded; nothing to add. The
+		// skip also keeps the write idempotent: a duplicated txid would pass the pending store's
+		// extends-history rule.
+		if record.candidate(txid).is_some() {
+			return Ok(());
+		}
+		let payment_id = record.id();
+		let intent = record.splice_intent().expect("find_splice_record only returns intents");
+
+		// The intent's contribution carries this node's actual stake in the splice; the wallet's
+		// `sent`/`received` view does not (it cannot see our share of the funding output). Use it
+		// whenever it describes the transaction being signed; otherwise — a fee bump already
+		// replaced the intent while an earlier round's signing event was being replayed — fall
+		// back to the wallet's view rather than misattribute the replacement's figures, and let
+		// the round's broadcast classification reconcile them.
+		let contribution = &intent.contribution;
+		let describes_tx = contribution
+			.inputs()
+			.iter()
+			.all(|input| tx.input.iter().any(|txin| txin.previous_output == input.outpoint()))
+			&& contribution.outputs().iter().all(|output| tx.output.contains(output));
+		let stake = if describes_tx {
+			LocalStakeAggregate::new(contribution.net_value(), contribution.estimated_fee())
+		} else {
+			LocalStakeAggregate {
+				amount_msat: wallet_amount_msat,
+				fee_paid_msat: wallet_fee_msat,
+				direction: wallet_direction,
+			}
+		};
+
+		// Append to the recorded history (empty for a first round, prior rounds for an RBF bump):
+		// the pending store's merge replaces the candidate list only when the update extends it.
+		let mut candidates = record.candidates().to_vec();
+		candidates.push(FundingTxCandidate {
+			txid,
+			amount_msat: stake.amount_msat,
+			fee_paid_msat: stake.fee_paid_msat,
+		});
+
+		let tx_type = TransactionType::InteractiveFunding {
+			channels: vec![Channel { counterparty_node_id, channel_id }],
+		};
+		let details = pending_funding_details(
+			payment_id,
+			txid,
+			tx_type,
+			stake.amount_msat,
+			stake.fee_paid_msat,
+			stake.direction,
+		);
+		self.persist_funding_payment_locked(&guard, details, candidates).await?;
+		log_debug!(
+			self.logger,
+			"Recorded signed splice funding {} for channel {}",
+			txid,
+			channel_id,
 		);
 		Ok(())
 	}
@@ -2793,6 +2910,24 @@ struct LocalStakeAggregate {
 	direction: PaymentDirection,
 }
 
+impl LocalStakeAggregate {
+	fn new(net_stake: SignedAmount, fee: Amount) -> Self {
+		// Direction is from our on-chain wallet's perspective: a positive net stake funds the
+		// channel (Outbound), while a negative one is a splice-out that returns funds to the
+		// wallet (Inbound).
+		let direction = if net_stake >= SignedAmount::ZERO {
+			PaymentDirection::Outbound
+		} else {
+			PaymentDirection::Inbound
+		};
+		Self {
+			amount_msat: Some(net_stake.unsigned_abs().to_sat() * 1000),
+			fee_paid_msat: Some(fee.to_sat() * 1000),
+			direction,
+		}
+	}
+}
+
 /// Aggregates our net stake across the channels of a single [`FundingCandidate`] by summing each
 /// channel's signed [`FundingContribution::net_value`]. Returns no amount if we contributed to none
 /// of them.
@@ -2815,18 +2950,27 @@ fn aggregate_local_stakes(candidate: &FundingCandidate) -> LocalStakeAggregate {
 			direction: PaymentDirection::Outbound,
 		};
 	}
-	// Direction is from our on-chain wallet's perspective: a positive net stake funds the channel
-	// (Outbound), while a negative one is a splice-out that returns funds to the wallet (Inbound).
-	let direction = if net_stake >= SignedAmount::ZERO {
-		PaymentDirection::Outbound
-	} else {
-		PaymentDirection::Inbound
-	};
-	LocalStakeAggregate {
-		amount_msat: Some(net_stake.unsigned_abs().to_sat() * 1000),
-		fee_paid_msat: Some(fee.to_sat() * 1000),
+	LocalStakeAggregate::new(net_stake, fee)
+}
+
+/// Builds the [`PaymentDetails`] of a freshly-observed funding transaction: an unconfirmed,
+/// pending on-chain payment tagged with its transaction type.
+fn pending_funding_details(
+	payment_id: PaymentId, txid: Txid, tx_type: TransactionType, amount_msat: Option<u64>,
+	fee_paid_msat: Option<u64>, direction: PaymentDirection,
+) -> PaymentDetails {
+	PaymentDetails::new(
+		payment_id,
+		PaymentKind::Onchain {
+			txid,
+			status: ConfirmationStatus::Unconfirmed,
+			tx_type: Some(tx_type),
+		},
+		amount_msat,
+		fee_paid_msat,
 		direction,
-	}
+		PaymentStatus::Pending,
+	)
 }
 
 /// Generates a fresh funding-record [`PaymentId`] from the OS entropy source. A funding record's id
@@ -3627,6 +3771,302 @@ mod tests {
 		// ...and the splice behind the intent confirmed, so the leftover intent record is removed
 		// rather than left to look like a splice still in flight after a restart.
 		assert!(wallet.pending_payment_store.get(&id).await.unwrap().is_none());
+	}
+
+	/// A [`test_splice_intent`] whose contribution is a splice-out of the given outputs, so a
+	/// signing-time recording can be checked to use the contribution's figures.
+	fn splice_out_intent(outputs: &[TxOut]) -> crate::payment::pending_payment_store::SpliceIntent {
+		use crate::payment::pending_payment_store::test_funding_contribution_with_outputs;
+
+		let mut intent = test_splice_intent();
+		intent.contribution = test_funding_contribution_with_outputs(253, outputs);
+		intent
+	}
+
+	#[tokio::test]
+	async fn signing_records_the_splice_funding_before_any_broadcast() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		// A splice-out moving 500k sat per the intent's contribution; the transaction also pays a
+		// wallet address (90k sat) so it registers wallet-level activity.
+		let splice_out =
+			TxOut { value: Amount::from_sat(500_000), script_pubkey: ScriptBuf::new() };
+		let intent = splice_out_intent(std::slice::from_ref(&splice_out));
+		let counterparty_node_id = intent.counterparty_node_id;
+		let channel_id = intent.channel_id;
+		let id = PaymentId([21u8; 32]);
+		wallet
+			.pending_payment_store
+			.insert(PendingPaymentDetails::pending_splice(id, intent))
+			.await
+			.unwrap();
+
+		let mut tx = wallet_paying_tx(&wallet, 1);
+		tx.output.push(splice_out);
+		let txid = tx.compute_txid();
+
+		wallet.record_signed_funding(counterparty_node_id, channel_id, &tx).await.unwrap();
+
+		// The intent record is promoted to a tracked payment carrying the signed transaction as a
+		// candidate, so wallet sync resolves either party's broadcast to it — no classification
+		// has run yet — while the intent stays until the splice locks.
+		let record = wallet
+			.pending_payment_store
+			.get(&id)
+			.await
+			.unwrap()
+			.expect("the record must be promoted");
+		assert!(record.details().is_some());
+		assert!(record.splice_intent().is_some());
+		let candidate = record.candidate(txid).expect("the signed transaction must be a candidate");
+		// The figures are the contribution's (a 500k sat splice-out), not the wallet's view of
+		// the transaction (a 90k sat receive).
+		assert_eq!(candidate.amount_msat, Some(500_000_000));
+		assert_eq!(wallet.find_payment_by_txid(txid).await.unwrap(), Some(id));
+
+		let payment = wallet.payment_store.get(&id).await.unwrap().expect("payment recorded");
+		assert_eq!(payment.amount_msat, Some(500_000_000));
+		assert_eq!(payment.direction, PaymentDirection::Inbound);
+		assert_eq!(payment.status, PaymentStatus::Pending);
+		match payment.kind {
+			PaymentKind::Onchain {
+				txid: recorded_txid,
+				status: ConfirmationStatus::Unconfirmed,
+				tx_type: Some(TransactionType::InteractiveFunding { channels }),
+			} => {
+				assert_eq!(recorded_txid, txid);
+				assert_eq!(channels.len(), 1);
+				assert_eq!(channels[0].counterparty_node_id, counterparty_node_id);
+				assert_eq!(channels[0].channel_id, channel_id);
+			},
+			kind => panic!("unexpected payment kind {:?}", kind),
+		}
+	}
+
+	#[tokio::test]
+	async fn replayed_signing_event_records_nothing_new() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		let splice_out =
+			TxOut { value: Amount::from_sat(500_000), script_pubkey: ScriptBuf::new() };
+		let intent = splice_out_intent(std::slice::from_ref(&splice_out));
+		let counterparty_node_id = intent.counterparty_node_id;
+		let channel_id = intent.channel_id;
+		let id = PaymentId([21u8; 32]);
+		wallet
+			.pending_payment_store
+			.insert(PendingPaymentDetails::pending_splice(id, intent))
+			.await
+			.unwrap();
+
+		let mut tx = wallet_paying_tx(&wallet, 1);
+		tx.output.push(splice_out);
+		let txid = tx.compute_txid();
+
+		// A store failure after the write makes the event handler replay the event; the repeated
+		// write must not duplicate the candidate (a duplicated txid would pass the pending
+		// store's extends-history rule).
+		wallet.record_signed_funding(counterparty_node_id, channel_id, &tx).await.unwrap();
+		wallet.record_signed_funding(counterparty_node_id, channel_id, &tx).await.unwrap();
+
+		let record = wallet.pending_payment_store.get(&id).await.unwrap().expect("record");
+		assert_eq!(record.candidates().iter().map(|c| c.txid).collect::<Vec<_>>(), vec![txid]);
+		assert_eq!(wallet.payment_store.list_page(None).await.unwrap().objects.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn rbf_signing_appends_a_candidate_preserving_history() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		let splice_out =
+			TxOut { value: Amount::from_sat(500_000), script_pubkey: ScriptBuf::new() };
+		let intent = splice_out_intent(std::slice::from_ref(&splice_out));
+		let counterparty_node_id = intent.counterparty_node_id;
+		let channel_id = intent.channel_id;
+		let id = PaymentId([21u8; 32]);
+		wallet
+			.pending_payment_store
+			.insert(PendingPaymentDetails::pending_splice(id, intent))
+			.await
+			.unwrap();
+
+		let mut tx = wallet_paying_tx(&wallet, 1);
+		tx.output.push(splice_out.clone());
+		let txid = tx.compute_txid();
+		wallet.record_signed_funding(counterparty_node_id, channel_id, &tx).await.unwrap();
+
+		// A fee bump replaced the intent (a bump reuses the channel's record), and its own
+		// signing event arrives for the replacement transaction.
+		let bump_out = TxOut { value: Amount::from_sat(499_000), script_pubkey: ScriptBuf::new() };
+		let bump_intent = splice_out_intent(std::slice::from_ref(&bump_out));
+		wallet
+			.pending_payment_store
+			.update(PendingPaymentDetailsUpdate {
+				id,
+				payment_update: None,
+				conflicting_txids: None,
+				candidates: Vec::new(),
+				splice_intent: Some(Some(bump_intent)),
+			})
+			.await
+			.unwrap();
+		let mut bump_tx = wallet_paying_tx(&wallet, 2);
+		bump_tx.output.push(bump_out);
+		let bump_txid = bump_tx.compute_txid();
+		wallet.record_signed_funding(counterparty_node_id, channel_id, &bump_tx).await.unwrap();
+
+		// The bump's candidate is appended; the replaced round keeps its own figures so a
+		// confirmation of either round reports that round's numbers.
+		let record = wallet.pending_payment_store.get(&id).await.unwrap().expect("record");
+		assert_eq!(
+			record.candidates().iter().map(|c| c.txid).collect::<Vec<_>>(),
+			vec![txid, bump_txid]
+		);
+		assert_eq!(record.candidate(txid).unwrap().amount_msat, Some(500_000_000));
+		assert_eq!(record.candidate(bump_txid).unwrap().amount_msat, Some(499_000_000));
+		let payment = wallet.payment_store.get(&id).await.unwrap().expect("payment");
+		assert!(
+			matches!(payment.kind, PaymentKind::Onchain { txid, .. } if txid == bump_txid),
+			"the bump must become the actively-tracked transaction"
+		);
+	}
+
+	#[tokio::test]
+	async fn signing_falls_back_to_wallet_figures_for_a_replaced_intent() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		// The stored intent no longer describes the transaction being signed: a fee bump replaced
+		// the intent while an earlier round's signing event was being replayed. The recording
+		// falls back to the wallet's view of the transaction rather than misattribute the
+		// replacement's figures to the earlier round.
+		let bump_out = TxOut { value: Amount::from_sat(499_000), script_pubkey: ScriptBuf::new() };
+		let intent = splice_out_intent(std::slice::from_ref(&bump_out));
+		let counterparty_node_id = intent.counterparty_node_id;
+		let channel_id = intent.channel_id;
+		let id = PaymentId([21u8; 32]);
+		wallet
+			.pending_payment_store
+			.insert(PendingPaymentDetails::pending_splice(id, intent))
+			.await
+			.unwrap();
+
+		// The replayed round's transaction pays the wallet 90k sat and carries none of the
+		// intent's outputs.
+		let tx = wallet_paying_tx(&wallet, 1);
+		let txid = tx.compute_txid();
+		wallet.record_signed_funding(counterparty_node_id, channel_id, &tx).await.unwrap();
+
+		let record = wallet.pending_payment_store.get(&id).await.unwrap().expect("record");
+		let candidate = record.candidate(txid).expect("candidate recorded");
+		assert_eq!(candidate.amount_msat, Some(90_000_000));
+	}
+
+	#[tokio::test]
+	async fn signing_skips_a_wallet_untouched_transaction() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		let splice_out =
+			TxOut { value: Amount::from_sat(500_000), script_pubkey: ScriptBuf::new() };
+		let intent = splice_out_intent(std::slice::from_ref(&splice_out));
+		let counterparty_node_id = intent.counterparty_node_id;
+		let channel_id = intent.channel_id;
+		let id = PaymentId([21u8; 32]);
+		wallet
+			.pending_payment_store
+			.insert(PendingPaymentDetails::pending_splice(id, intent))
+			.await
+			.unwrap();
+
+		// A splice-out to an external address moves no wallet funds; like classification, the
+		// signing-time recording declines it — wallet sync cannot observe it either, so there is
+		// no race to close.
+		let tx = Transaction {
+			version: bitcoin::transaction::Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: vec![bitcoin::TxIn {
+				previous_output: OutPoint { txid: Txid::from_byte_array([1u8; 32]), vout: 0 },
+				..Default::default()
+			}],
+			output: vec![splice_out],
+		};
+		wallet.record_signed_funding(counterparty_node_id, channel_id, &tx).await.unwrap();
+
+		let record = wallet.pending_payment_store.get(&id).await.unwrap().expect("record");
+		assert!(record.details().is_none(), "the intent record must stay pre-broadcast");
+		assert!(wallet.payment_store.get(&id).await.unwrap().is_none());
+	}
+
+	#[tokio::test]
+	async fn signing_without_an_intent_leaves_recording_to_classification() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		// No intent record exists for the channel (e.g. a hypothetical V2 dual-funded open, which
+		// this node never initiates through a splice entry point): nothing is recorded, and
+		// broadcast-time classification remains the transaction's first writer.
+		let counterparty_node_id = test_splice_intent().counterparty_node_id;
+		let channel_id = test_splice_intent().channel_id;
+		let tx = wallet_paying_tx(&wallet, 1);
+		wallet.record_signed_funding(counterparty_node_id, channel_id, &tx).await.unwrap();
+
+		assert!(wallet.payment_store.list_page(None).await.unwrap().objects.is_empty());
+		assert!(wallet.pending_payment_store.list_filter(|_| true).await.is_empty());
+	}
+
+	#[tokio::test]
+	async fn classification_converges_on_the_signing_time_record() {
+		use lightning::chain::chaininterface::{ChannelFunding, FundingPurpose};
+
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		let splice_out =
+			TxOut { value: Amount::from_sat(500_000), script_pubkey: ScriptBuf::new() };
+		let intent = splice_out_intent(std::slice::from_ref(&splice_out));
+		let counterparty_node_id = intent.counterparty_node_id;
+		let channel_id = intent.channel_id;
+		let contribution = intent.contribution.clone();
+		let id = PaymentId([21u8; 32]);
+		wallet
+			.pending_payment_store
+			.insert(PendingPaymentDetails::pending_splice(id, intent))
+			.await
+			.unwrap();
+
+		let mut tx = wallet_paying_tx(&wallet, 1);
+		tx.output.push(splice_out);
+		let txid = tx.compute_txid();
+		wallet.record_signed_funding(counterparty_node_id, channel_id, &tx).await.unwrap();
+		let record = wallet.pending_payment_store.get(&id).await.unwrap().expect("record");
+		assert!(record.details().is_some(), "the signing write must have recorded the payment");
+
+		// The round's broadcast classification then runs with LDK's full candidate list; it must
+		// land on the same record — same id, same single candidate — rather than fork a second.
+		let tx_type = LdkTransactionType::InteractiveFunding {
+			candidates: vec![FundingCandidate {
+				txid,
+				channels: vec![ChannelFunding {
+					counterparty_node_id,
+					channel_id,
+					purpose: FundingPurpose::Splice,
+					contribution: Some(contribution),
+				}],
+			}],
+		};
+		wallet.classify_broadcast(&tx, &tx_type).await.unwrap();
+
+		let payments = wallet.payment_store.list_page(None).await.unwrap().objects;
+		assert_eq!(payments.len(), 1, "classification must not create a second record");
+		assert_eq!(payments[0].id, id);
+		assert_eq!(payments[0].amount_msat, Some(500_000_000));
+		let record = wallet.pending_payment_store.get(&id).await.unwrap().expect("record");
+		assert_eq!(record.candidates().iter().map(|c| c.txid).collect::<Vec<_>>(), vec![txid]);
+		assert!(record.splice_intent().is_some());
 	}
 
 	#[tokio::test]

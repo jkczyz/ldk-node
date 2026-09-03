@@ -201,6 +201,14 @@ impl PendingPaymentDetails {
 			},
 		}
 	}
+
+	/// This node's recorded per-candidate funding figures across the RBF history.
+	pub(crate) fn candidates(&self) -> &[FundingTxCandidate] {
+		match self {
+			Self::PendingSplice { .. } => &[],
+			Self::Tracked { candidates, .. } => candidates,
+		}
+	}
 }
 
 impl_writeable_tlv_based_enum!(PendingPaymentDetails,

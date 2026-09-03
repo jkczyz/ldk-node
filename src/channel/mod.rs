@@ -335,6 +335,21 @@ impl SpliceTracker {
 		}
 	}
 
+	/// Records the funding payment of a splice whose transaction this node has just signed but
+	/// not yet handed back to LDK, so the record durably precedes any broadcast: the counterparty
+	/// cannot broadcast before receiving our `tx_signatures`, which only
+	/// [`ChannelManager::funding_transaction_signed`] releases. Holding the submit lock keeps the
+	/// channel's intent record from changing hands mid-write — a concurrent [`Self::submit`]
+	/// replacing the intent, or a failure event settling it.
+	///
+	/// [`ChannelManager::funding_transaction_signed`]: lightning::ln::channelmanager::ChannelManager::funding_transaction_signed
+	pub(crate) async fn on_funding_ready_for_signing(
+		&self, counterparty_node_id: PublicKey, channel_id: ChannelId, tx: &Transaction,
+	) -> Result<(), Error> {
+		let _guard = self.submit_lock.lock().await;
+		self.wallet.record_signed_funding(counterparty_node_id, channel_id, tx).await
+	}
+
 	/// Begins settling the recorded splice a failure event concerns, snapshotting the intent
 	/// `contribution` identifies — if any; a failure of some other attempt (e.g. one superseded
 	/// by a fee bump, whose failure LDK reports separately) identifies nothing and settles
