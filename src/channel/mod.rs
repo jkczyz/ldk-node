@@ -27,7 +27,7 @@ use crate::payment::pending_payment_store::{
 use crate::payment::store::PaymentDetails;
 use crate::payment::PaymentStatus;
 use crate::types::{ChannelManager, PaymentStore, PendingPaymentStore};
-use crate::wallet::{random_payment_id, Wallet};
+use crate::wallet::{random_payment_id, SignedFundingRetraction, Wallet};
 use crate::Error;
 
 /// Whether two contributions describe the same splice attempt. LDK may adjust a contribution
@@ -345,9 +345,25 @@ impl SpliceTracker {
 	/// [`ChannelManager::funding_transaction_signed`]: lightning::ln::channelmanager::ChannelManager::funding_transaction_signed
 	pub(crate) async fn on_funding_ready_for_signing(
 		&self, counterparty_node_id: PublicKey, channel_id: ChannelId, tx: &Transaction,
-	) -> Result<(), Error> {
+	) -> Result<Option<SignedFundingRetraction>, Error> {
 		let _guard = self.submit_lock.lock().await;
 		self.wallet.record_signed_funding(counterparty_node_id, channel_id, tx).await
+	}
+
+	/// Retracts the funding payment recorded by [`Self::on_funding_ready_for_signing`] when LDK
+	/// then refused the signed transaction, so the aborted round does not linger as a payment
+	/// nothing can ever confirm, or as a recorded candidate that no later round's classification
+	/// would carry (the candidate history may only grow, so such a list would be refused
+	/// wholesale). Holding the submit lock orders the retraction before any concurrent splice
+	/// submission touching the same record.
+	pub(crate) async fn on_funding_signing_failed(
+		&self, retraction: Option<SignedFundingRetraction>,
+	) {
+		let Some(retraction) = retraction else {
+			return;
+		};
+		let _guard = self.submit_lock.lock().await;
+		self.wallet.retract_signed_funding(retraction).await;
 	}
 
 	/// Begins settling the recorded splice a failure event concerns, snapshotting the intent

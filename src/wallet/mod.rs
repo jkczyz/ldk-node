@@ -2056,7 +2056,7 @@ impl Wallet {
 	/// [`ChannelManager::funding_transaction_signed`]: lightning::ln::channelmanager::ChannelManager::funding_transaction_signed
 	pub(crate) async fn record_signed_funding(
 		&self, counterparty_node_id: PublicKey, channel_id: ChannelId, tx: &Transaction,
-	) -> Result<(), Error> {
+	) -> Result<Option<SignedFundingRetraction>, Error> {
 		let txid = tx.compute_txid();
 
 		// Same participation rule as `classify_interactive_funding`: a transaction that moves no
@@ -2069,7 +2069,7 @@ impl Wallet {
 				"Not recording signed funding {} as a payment: no wallet-level activity",
 				txid,
 			);
-			return Ok(());
+			return Ok(None);
 		}
 
 		// Resolution and the write below must share one lock acquisition, as in classification:
@@ -2085,14 +2085,14 @@ impl Wallet {
 					channel_id,
 					txid,
 				);
-				return Ok(());
+				return Ok(None);
 			},
 		};
 		// A replayed signing event re-offers a transaction already recorded; nothing to add. The
 		// skip also keeps the write idempotent: a duplicated txid would pass the pending store's
 		// extends-history rule.
 		if record.candidate(txid).is_some() {
-			return Ok(());
+			return Ok(None);
 		}
 		let payment_id = record.id();
 		let intent = record.splice_intent().expect("find_splice_record only returns intents");
@@ -2139,6 +2139,7 @@ impl Wallet {
 			stake.fee_paid_msat,
 			stake.direction,
 		);
+		let prior_details = self.payment_store.get(&payment_id).await?;
 		self.persist_funding_payment_locked(&guard, details, candidates).await?;
 		log_debug!(
 			self.logger,
@@ -2146,7 +2147,104 @@ impl Wallet {
 			txid,
 			channel_id,
 		);
-		Ok(())
+
+		// Snapshot what the write replaced and what it produced — still under the lock, so
+		// nothing lands in between — for retracting the write if the signed transaction is then
+		// never accepted by LDK.
+		let posted_details = self.payment_store.get(&payment_id).await?;
+		let posted_pending = self.pending_payment_store.get(&payment_id).await?;
+		Ok(posted_details.zip(posted_pending).map(|(posted_details, posted_pending)| {
+			SignedFundingRetraction {
+				payment_id,
+				prior_details,
+				posted_details,
+				prior_pending: record,
+				posted_pending,
+			}
+		}))
+	}
+
+	/// Retracts a [`Self::record_signed_funding`] write whose transaction was then never accepted
+	/// by LDK — nothing can ever broadcast it, so left in place the write would strand a payment
+	/// nothing can confirm and a recorded candidate no later round's classification list would
+	/// carry (the candidate history may only grow, so such a list would be refused wholesale).
+	///
+	/// Each store is restored only while it still holds exactly what the write produced: a record
+	/// that has since changed hands (e.g. a newer splice submission replaced the intent) is left
+	/// alone rather than have the newer writer's work thrown away.
+	pub(crate) async fn retract_signed_funding(&self, retraction: SignedFundingRetraction) {
+		let SignedFundingRetraction {
+			payment_id,
+			prior_details,
+			posted_details,
+			prior_pending,
+			posted_pending,
+		} = retraction;
+		let _guard = self.funding_payment_update_lock.lock().await;
+
+		// The pending entry anchors the record (txid resolution and graduation go through it), so
+		// it gates the retraction: if it changed hands, leave the payment record alone too rather
+		// than tear the two stores apart.
+		let mut restored = false;
+		let flag = &mut restored;
+		let result = self
+			.pending_payment_store
+			.mutate(&payment_id, |existing| {
+				if existing == Some(&posted_pending) {
+					*flag = true;
+					Some(prior_pending.clone())
+				} else {
+					None
+				}
+			})
+			.await;
+		if let Err(e) = result {
+			log_error!(
+				self.logger,
+				"Failed to retract the signed funding record of payment {}: an aborted splice \
+				round may linger as a candidate: {}",
+				payment_id,
+				e,
+			);
+			return;
+		}
+		if !restored {
+			log_debug!(
+				self.logger,
+				"Not retracting the signed funding record of payment {}: the record changed hands",
+				payment_id,
+			);
+			return;
+		}
+
+		let result = match prior_details {
+			Some(prior) => self
+				.payment_store
+				.mutate(&payment_id, |existing| {
+					(existing == Some(&posted_details)).then(|| prior.clone())
+				})
+				.await
+				.map(|_| ()),
+			// The write created the payment record; remove it again unless something else has
+			// written to it in the meantime (the funding-record writers all serialize on the
+			// cross-store lock held here).
+			None => match self.payment_store.get(&payment_id).await {
+				Ok(Some(current)) if current == posted_details => {
+					self.payment_store.remove(&payment_id).await
+				},
+				Ok(_) => Ok(()),
+				Err(e) => Err(e),
+			},
+		};
+		if let Err(e) = result {
+			log_error!(
+				self.logger,
+				"Failed to retract the payment record of aborted splice round {}: a payment \
+				nothing can confirm may linger: {}",
+				payment_id,
+				e,
+			);
+		}
 	}
 
 	/// Records a non-funding LDK broadcast as an on-chain payment, tagged with its transaction type.
@@ -2971,6 +3069,17 @@ fn pending_funding_details(
 		direction,
 		PaymentStatus::Pending,
 	)
+}
+
+/// A snapshot taken by [`Wallet::record_signed_funding`] of the states its write replaced, so the
+/// write can be retracted through [`Wallet::retract_signed_funding`] if the signed transaction is
+/// then never accepted by LDK.
+pub(crate) struct SignedFundingRetraction {
+	payment_id: PaymentId,
+	prior_details: Option<PaymentDetails>,
+	posted_details: PaymentDetails,
+	prior_pending: PendingPaymentDetails,
+	posted_pending: PendingPaymentDetails,
 }
 
 /// Generates a fresh funding-record [`PaymentId`] from the OS entropy source. A funding record's id
@@ -4067,6 +4176,156 @@ mod tests {
 		let record = wallet.pending_payment_store.get(&id).await.unwrap().expect("record");
 		assert_eq!(record.candidates().iter().map(|c| c.txid).collect::<Vec<_>>(), vec![txid]);
 		assert!(record.splice_intent().is_some());
+	}
+
+	#[tokio::test]
+	async fn retracting_a_signing_write_restores_the_prior_records() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		let splice_out =
+			TxOut { value: Amount::from_sat(500_000), script_pubkey: ScriptBuf::new() };
+		let intent = splice_out_intent(std::slice::from_ref(&splice_out));
+		let counterparty_node_id = intent.counterparty_node_id;
+		let channel_id = intent.channel_id;
+		let id = PaymentId([21u8; 32]);
+		wallet
+			.pending_payment_store
+			.insert(PendingPaymentDetails::pending_splice(id, intent))
+			.await
+			.unwrap();
+
+		let mut tx = wallet_paying_tx(&wallet, 1);
+		tx.output.push(splice_out);
+
+		// LDK refused the signed transaction, so nothing can ever broadcast it: the write is
+		// retracted, leaving no payment nothing can confirm and no candidate that would poison
+		// later rounds' classification lists (the candidate history may only grow).
+		let retraction = wallet
+			.record_signed_funding(counterparty_node_id, channel_id, &tx)
+			.await
+			.unwrap()
+			.expect("a recording must be retractable");
+		wallet.retract_signed_funding(retraction).await;
+
+		let record = wallet
+			.pending_payment_store
+			.get(&id)
+			.await
+			.unwrap()
+			.expect("the intent record must survive the retraction");
+		assert!(record.details().is_none(), "the record must be back to pre-broadcast");
+		assert!(record.splice_intent().is_some());
+		assert!(record.candidates().is_empty());
+		assert!(wallet.payment_store.get(&id).await.unwrap().is_none());
+	}
+
+	#[tokio::test]
+	async fn retracting_a_bump_signing_write_restores_the_prior_round() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		let splice_out =
+			TxOut { value: Amount::from_sat(500_000), script_pubkey: ScriptBuf::new() };
+		let intent = splice_out_intent(std::slice::from_ref(&splice_out));
+		let counterparty_node_id = intent.counterparty_node_id;
+		let channel_id = intent.channel_id;
+		let id = PaymentId([21u8; 32]);
+		wallet
+			.pending_payment_store
+			.insert(PendingPaymentDetails::pending_splice(id, intent))
+			.await
+			.unwrap();
+		let mut tx = wallet_paying_tx(&wallet, 1);
+		tx.output.push(splice_out);
+		let txid = tx.compute_txid();
+		wallet.record_signed_funding(counterparty_node_id, channel_id, &tx).await.unwrap();
+
+		// A fee bump is signed but then refused by LDK: retracting its write must restore the
+		// original round as the actively-tracked transaction, figures included.
+		let bump_out = TxOut { value: Amount::from_sat(499_000), script_pubkey: ScriptBuf::new() };
+		let bump_intent = splice_out_intent(std::slice::from_ref(&bump_out));
+		wallet
+			.pending_payment_store
+			.update(PendingPaymentDetailsUpdate {
+				id,
+				payment_update: None,
+				conflicting_txids: None,
+				candidates: Vec::new(),
+				splice_intent: Some(Some(bump_intent.clone())),
+			})
+			.await
+			.unwrap();
+		let mut bump_tx = wallet_paying_tx(&wallet, 2);
+		bump_tx.output.push(bump_out);
+		let retraction = wallet
+			.record_signed_funding(counterparty_node_id, channel_id, &bump_tx)
+			.await
+			.unwrap()
+			.expect("a recording must be retractable");
+		wallet.retract_signed_funding(retraction).await;
+
+		let record = wallet.pending_payment_store.get(&id).await.unwrap().expect("record");
+		assert_eq!(record.candidates().iter().map(|c| c.txid).collect::<Vec<_>>(), vec![txid]);
+		// The retraction undoes only the signing write; the bump's intent is settled separately,
+		// by the failure event the abort produces.
+		assert_eq!(record.splice_intent(), Some(&bump_intent));
+		let payment = wallet.payment_store.get(&id).await.unwrap().expect("payment");
+		assert!(
+			matches!(payment.kind, PaymentKind::Onchain { txid: t, .. } if t == txid),
+			"the original round must be the actively-tracked transaction again"
+		);
+		assert_eq!(payment.amount_msat, Some(500_000_000));
+	}
+
+	#[tokio::test]
+	async fn retraction_declines_once_the_record_changed_hands() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+
+		let splice_out =
+			TxOut { value: Amount::from_sat(500_000), script_pubkey: ScriptBuf::new() };
+		let intent = splice_out_intent(std::slice::from_ref(&splice_out));
+		let counterparty_node_id = intent.counterparty_node_id;
+		let channel_id = intent.channel_id;
+		let id = PaymentId([21u8; 32]);
+		wallet
+			.pending_payment_store
+			.insert(PendingPaymentDetails::pending_splice(id, intent))
+			.await
+			.unwrap();
+		let mut tx = wallet_paying_tx(&wallet, 1);
+		tx.output.push(splice_out);
+		let txid = tx.compute_txid();
+		let retraction = wallet
+			.record_signed_funding(counterparty_node_id, channel_id, &tx)
+			.await
+			.unwrap()
+			.expect("a recording must be retractable");
+
+		// A new splice submission replaced the intent before the retraction ran: the record
+		// changed hands, and restoring the snapshot would throw away the newer intent. The
+		// retraction must leave the record alone — payment record included.
+		let newer_out = TxOut { value: Amount::from_sat(400_000), script_pubkey: ScriptBuf::new() };
+		let newer_intent = splice_out_intent(std::slice::from_ref(&newer_out));
+		wallet
+			.pending_payment_store
+			.update(PendingPaymentDetailsUpdate {
+				id,
+				payment_update: None,
+				conflicting_txids: None,
+				candidates: Vec::new(),
+				splice_intent: Some(Some(newer_intent.clone())),
+			})
+			.await
+			.unwrap();
+		wallet.retract_signed_funding(retraction).await;
+
+		let record = wallet.pending_payment_store.get(&id).await.unwrap().expect("record");
+		assert!(record.details().is_some(), "a record that changed hands must not be restored");
+		assert_eq!(record.splice_intent(), Some(&newer_intent));
+		assert_eq!(record.candidates().iter().map(|c| c.txid).collect::<Vec<_>>(), vec![txid]);
+		assert!(wallet.payment_store.get(&id).await.unwrap().is_some());
 	}
 
 	#[tokio::test]
