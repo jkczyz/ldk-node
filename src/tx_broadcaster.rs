@@ -22,11 +22,11 @@ use crate::Error;
 
 const BCAST_PACKAGE_QUEUE_SIZE: usize = 256;
 
-/// The most non-funding packages [`RetryQueue`] holds. Claims and sweeps re-enter the
-/// broadcast queue on LDK's periodic rebroadcast timers, so one dropped here resurfaces on its
-/// own once the store recovers. Funding packages don't count against the bound: nothing
-/// re-broadcasts them for us, and they are finite — one per negotiated candidate, since a copy
-/// of a waiting package is never queued twice.
+/// The most droppable packages [`RetryQueue`] holds. Claims and sweeps re-enter the broadcast
+/// queue on LDK's periodic rebroadcast timers, so one dropped here resurfaces on its own once
+/// the store recovers. Packages nothing re-broadcasts — fundings and cooperative closes —
+/// don't count against the bound: they are finite — one per negotiated funding candidate and
+/// one per closing channel, since a copy of a waiting package is never queued twice.
 const MAX_QUEUED_RETRIES: usize = BCAST_PACKAGE_QUEUE_SIZE;
 
 /// A package of transactions that LDK handed to the broadcaster in one `broadcast_transactions`
@@ -65,17 +65,30 @@ impl BroadcastPackage {
 		txids
 	}
 
-	/// Whether the package contains a funding transaction (a channel open or splice), whose
-	/// classification writes the payment record tracking the funding.
-	fn contains_funding(&self) -> bool {
-		self.0.iter().any(|(_, tx_type)| {
-			matches!(
-				tx_type,
-				Some(
-					LdkTransactionType::Funding { .. }
-						| LdkTransactionType::InteractiveFunding { .. }
-				)
-			)
+	/// Whether the package may be dropped to keep [`RetryQueue`] within its bound: every
+	/// transaction in it is re-broadcast by its originator, so a dropped package resurfaces on
+	/// its own. LDK re-hands claims, anchor bumps, and force-close commitments to the
+	/// broadcaster periodically, and the sweeper regenerates sweeps once per block. Nothing
+	/// re-broadcasts a funding transaction (a channel open or splice, whose classification
+	/// writes the payment record tracking the funding) or a cooperative close (whose channel is
+	/// gone from the `ChannelManager` by broadcast time), so a package containing either is
+	/// never dropped.
+	fn is_droppable(&self) -> bool {
+		self.0.iter().all(|(_, tx_type)| match tx_type {
+			Some(
+				LdkTransactionType::Funding { .. }
+				| LdkTransactionType::InteractiveFunding { .. }
+				| LdkTransactionType::CooperativeClose { .. },
+			) => false,
+			Some(
+				LdkTransactionType::UnilateralClose { .. }
+				| LdkTransactionType::AnchorBump { .. }
+				| LdkTransactionType::Claim { .. }
+				| LdkTransactionType::Sweep { .. },
+			) => true,
+			// Wallet-originated: re-submitted on chain tip changes. Never queued anyway, since
+			// classification of an untyped package is a no-op that can't fail.
+			None => true,
 		})
 	}
 }
@@ -84,14 +97,14 @@ impl BroadcastPackage {
 /// the package won't be retried as-is.
 pub(crate) enum ScheduleOutcome {
 	/// The package waits for its retry deadline. When the bound was reached, the oldest waiting
-	/// non-funding package was dropped to make room and is returned — its transactions resurface
+	/// droppable package was dropped to make room and is returned — its transactions resurface
 	/// with LDK's next periodic rebroadcast.
 	Scheduled { dropped: Option<BroadcastPackage> },
 	/// A package broadcasting the same transactions already waits, and its retry covers this
 	/// one: the incoming package is dropped and returned.
 	AlreadyQueued(BroadcastPackage),
-	/// The bound was reached and every waiting package is a funding package, which must not be
-	/// dropped: the incoming package is refused and returned.
+	/// The bound was reached and every waiting package is one that must not be dropped (a
+	/// funding or a cooperative close): the incoming package is refused and returned.
 	Refused(BroadcastPackage),
 }
 
@@ -120,8 +133,8 @@ impl RetryQueue {
 	}
 
 	/// Schedules a package to retry at `retry_at`, unless a package with the same transactions already
-	/// waits or accepting it would exceed [`MAX_QUEUED_RETRIES`] with no non-funding package to
-	/// drop for it; see [`ScheduleOutcome`].
+	/// waits or accepting it would exceed [`MAX_QUEUED_RETRIES`] with no droppable package to
+	/// make room with; see [`ScheduleOutcome`].
 	pub(crate) fn schedule(
 		&mut self, package: BroadcastPackage, retry_at: Instant,
 	) -> ScheduleOutcome {
@@ -137,12 +150,14 @@ impl RetryQueue {
 		}
 
 		let mut dropped = None;
-		if !package.contains_funding() && self.0.len() >= MAX_QUEUED_RETRIES {
-			// Drop the oldest non-funding package: LDK re-broadcasts its transactions
+		if package.is_droppable() && self.0.len() >= MAX_QUEUED_RETRIES {
+			// Drop the oldest droppable package: its transactions are re-broadcast
 			// periodically, while the incoming package may carry a fresher fee-bumped variant.
 			// A funding package is never dropped — nothing would re-broadcast it, and losing it
-			// leaves its transaction confirming without a recorded candidate.
-			match self.0.iter().position(|(_, _, waiting)| !waiting.contains_funding()) {
+			// leaves its transaction confirming without a recorded candidate. Neither is a
+			// cooperative close, whose queued package may hold the only copy of the signed
+			// closing transaction.
+			match self.0.iter().position(|(_, _, waiting)| waiting.is_droppable()) {
 				Some(oldest) => dropped = self.0.remove(oldest).map(|(_, _, package)| package),
 				None => return ScheduleOutcome::Refused(package),
 			}
@@ -423,6 +438,34 @@ mod tests {
 		BroadcastPackage::new(&[(tx, LdkTransactionType::Funding { channels: vec![] })])
 	}
 
+	fn test_counterparty_node_id() -> bitcoin::secp256k1::PublicKey {
+		use std::str::FromStr;
+		bitcoin::secp256k1::PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.unwrap()
+	}
+
+	fn coop_close_package(tx: &Transaction) -> BroadcastPackage {
+		BroadcastPackage::new(&[(
+			tx,
+			LdkTransactionType::CooperativeClose {
+				counterparty_node_id: test_counterparty_node_id(),
+				channel_id: lightning::ln::types::ChannelId([13u8; 32]),
+			},
+		)])
+	}
+
+	fn claim_package(tx: &Transaction) -> BroadcastPackage {
+		BroadcastPackage::new(&[(
+			tx,
+			LdkTransactionType::Claim {
+				counterparty_node_id: test_counterparty_node_id(),
+				channel_id: lightning::ln::types::ChannelId([13u8; 32]),
+			},
+		)])
+	}
+
 	fn deadline(secs: u64) -> tokio::time::Instant {
 		tokio::time::Instant::now() + std::time::Duration::from_secs(secs)
 	}
@@ -475,10 +518,10 @@ mod tests {
 	}
 
 	/// Distinct transactions (e.g. fee-bumped claim variants during a store outage) are held to
-	/// the bound: the oldest non-funding package is dropped for an incoming one, never a funding
+	/// the bound: the oldest droppable package is dropped for an incoming one, never a funding
 	/// package.
 	#[tokio::test]
-	async fn retry_queue_drops_the_oldest_non_funding_package_at_the_bound() {
+	async fn retry_queue_drops_the_oldest_droppable_package_at_the_bound() {
 		fn numbered_tx(n: u32) -> Transaction {
 			Transaction {
 				version: bitcoin::transaction::Version::TWO,
@@ -502,7 +545,7 @@ mod tests {
 			));
 		}
 
-		// At the bound, an incoming non-funding package drops the oldest waiting one — not the
+		// At the bound, an incoming droppable package drops the oldest waiting one — not the
 		// older funding package.
 		let new_claim = numbered_tx(MAX_QUEUED_RETRIES as u32);
 		match retries.schedule(BroadcastPackage::unclassified(new_claim.clone()), deadline(2)) {
@@ -528,11 +571,11 @@ mod tests {
 		assert!(!remaining.contains(&oldest_claim.compute_txid()));
 	}
 
-	/// When only funding packages wait at the bound, an incoming non-funding package is refused:
+	/// When only funding packages wait at the bound, an incoming droppable package is refused:
 	/// LDK re-broadcasts claims and sweeps periodically, while a dropped funding package would
 	/// leave its transaction confirming without a recorded candidate.
 	#[tokio::test]
-	async fn retry_queue_refuses_a_non_funding_package_over_waiting_funding_packages() {
+	async fn retry_queue_refuses_a_droppable_package_over_waiting_funding_packages() {
 		fn numbered_tx(n: u32) -> Transaction {
 			Transaction {
 				version: bitcoin::transaction::Version::TWO,
@@ -553,6 +596,91 @@ mod tests {
 		let claim = numbered_tx(MAX_QUEUED_RETRIES as u32);
 		assert!(matches!(
 			retries.schedule(BroadcastPackage::unclassified(claim), deadline(2)),
+			ScheduleOutcome::Refused(_)
+		));
+	}
+
+	/// A cooperative close is never dropped at the bound: nothing re-broadcasts it, and the
+	/// queued package may hold the only copy of the signed closing transaction.
+	#[tokio::test]
+	async fn retry_queue_never_drops_a_cooperative_close_at_the_bound() {
+		fn numbered_tx(n: u32) -> Transaction {
+			Transaction {
+				version: bitcoin::transaction::Version::TWO,
+				lock_time: bitcoin::absolute::LockTime::ZERO,
+				input: vec![txin(Txid::from_byte_array([9u8; 32]), n)],
+				output: vec![txout(1_000)],
+			}
+		}
+
+		let mut retries = RetryQueue::new();
+		let coop_close_tx = numbered_tx(0);
+		assert!(matches!(
+			retries.schedule(coop_close_package(&coop_close_tx), deadline(2)),
+			ScheduleOutcome::Scheduled { dropped: None }
+		));
+		let oldest_claim = numbered_tx(1);
+		for n in 1..(MAX_QUEUED_RETRIES as u32) {
+			assert!(matches!(
+				retries.schedule(claim_package(&numbered_tx(n)), deadline(2)),
+				ScheduleOutcome::Scheduled { dropped: None }
+			));
+		}
+
+		// At the bound, an incoming claim drops the oldest waiting claim — not the older
+		// cooperative close.
+		let new_claim = numbered_tx(MAX_QUEUED_RETRIES as u32);
+		match retries.schedule(claim_package(&new_claim), deadline(2)) {
+			ScheduleOutcome::Scheduled { dropped: Some(dropped) } => {
+				assert_eq!(dropped.sorted_txids(), vec![oldest_claim.compute_txid()]);
+			},
+			_ => panic!("the incoming claim must be scheduled by dropping the oldest one"),
+		}
+
+		// An incoming cooperative close is never dropped for the bound either.
+		let new_coop_close_tx = numbered_tx(MAX_QUEUED_RETRIES as u32 + 1);
+		assert!(matches!(
+			retries.schedule(coop_close_package(&new_coop_close_tx), deadline(2)),
+			ScheduleOutcome::Scheduled { dropped: None }
+		));
+
+		let mut remaining = Vec::new();
+		while let Some(package) = retries.pop_next() {
+			remaining.extend(package.sorted_txids());
+		}
+		assert!(
+			remaining.contains(&coop_close_tx.compute_txid()),
+			"a cooperative close is never dropped"
+		);
+		assert!(remaining.contains(&new_coop_close_tx.compute_txid()));
+		assert!(!remaining.contains(&oldest_claim.compute_txid()));
+	}
+
+	/// When only cooperative closes wait at the bound, an incoming claim is refused: LDK
+	/// re-broadcasts the claim periodically, while a dropped close would lose the only copy of
+	/// its signed closing transaction.
+	#[tokio::test]
+	async fn retry_queue_refuses_a_claim_over_waiting_cooperative_closes() {
+		fn numbered_tx(n: u32) -> Transaction {
+			Transaction {
+				version: bitcoin::transaction::Version::TWO,
+				lock_time: bitcoin::absolute::LockTime::ZERO,
+				input: vec![txin(Txid::from_byte_array([10u8; 32]), n)],
+				output: vec![txout(1_000)],
+			}
+		}
+
+		let mut retries = RetryQueue::new();
+		for n in 0..(MAX_QUEUED_RETRIES as u32) {
+			assert!(matches!(
+				retries.schedule(coop_close_package(&numbered_tx(n)), deadline(2)),
+				ScheduleOutcome::Scheduled { dropped: None }
+			));
+		}
+
+		let claim = numbered_tx(MAX_QUEUED_RETRIES as u32);
+		assert!(matches!(
+			retries.schedule(claim_package(&claim), deadline(2)),
 			ScheduleOutcome::Refused(_)
 		));
 	}
