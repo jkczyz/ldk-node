@@ -27,7 +27,10 @@ use serde_json::Value;
 
 use crate::runtime::Effect;
 use crate::session::{Decision, Session};
-use crate::tools::{SetChannelFeesInput, SpliceInInput, SET_CHANNEL_FEES, SPLICE_IN, WRITE_TOOLS};
+use crate::tools::{
+	SetChannelFeesInput, SpliceInInput, SpliceOutInput, SET_CHANNEL_FEES, SPLICE_IN, SPLICE_OUT,
+	WRITE_TOOLS,
+};
 
 /// Operator-set limits. Read tools are never gated; write tools inside these bounds are
 /// auto-approved; anything else yields for a decision.
@@ -45,10 +48,9 @@ impl Default for PolicyBounds {
 }
 
 impl PolicyBounds {
-	/// `POLICY_MIN_FEE_PPM`, `POLICY_MAX_FEE_PPM`, `POLICY_MAX_AUTO_SPLICE_SATS`; defaults
-	/// otherwise.
-	pub fn from_env() -> Result<Self> {
-		let defaults = Self::default();
+	/// `POLICY_MIN_FEE_PPM`, `POLICY_MAX_FEE_PPM`, `POLICY_MAX_AUTO_SPLICE_SATS`; the given
+	/// defaults otherwise.
+	pub fn from_env_or(defaults: Self) -> Result<Self> {
 		Ok(Self {
 			min_fee_ppm: env_number("POLICY_MIN_FEE_PPM", defaults.min_fee_ppm)?,
 			max_fee_ppm: env_number("POLICY_MAX_FEE_PPM", defaults.max_fee_ppm)?,
@@ -151,6 +153,20 @@ impl Policy {
 					))
 				}
 			},
+			SPLICE_OUT => {
+				let Ok(input) = serde_json::from_value::<SpliceOutInput>(arguments.clone()) else {
+					return Verdict::PassThrough;
+				};
+				if input.amount_sats <= self.bounds.max_auto_splice_sats {
+					Verdict::PassThrough
+				} else {
+					proposal(format!(
+						"Outside policy: splices above {} sats need approval; this one moves {} \
+						 sats out of the channel to the on-chain wallet.",
+						self.bounds.max_auto_splice_sats, input.amount_sats
+					))
+				}
+			},
 			_ => proposal("Outside policy: this action always needs approval.".to_string()),
 		}
 	}
@@ -209,7 +225,8 @@ impl Operation<Session, Effect> for Policy {
 	) -> Result<Vec<(String, String)>> {
 		let text = format!(
 			"Operator policy: forwarding fee changes between {} and {} ppm are applied without \
-			 asking. Splices up to {} sats are applied without asking. Every other fund-moving \
+			 asking. Splices of up to {} sats, in or out, are applied without asking. Every other \
+			 fund-moving \
 			 action is proposed to the operator and only executed after approval; a declined \
 			 action comes back as a tool error, and you should not retry it unchanged. Read-only \
 			 tools are always available.",
@@ -295,16 +312,22 @@ mod tests {
 		let conversation = conversation(vec![
 			request("r1", SET_CHANNEL_FEES, json!({"channel_id": "abcdef01", "fee_ppm": 9000})),
 			request("r2", SPLICE_IN, json!({"channel_id": "abcdef01", "amount_sats": 50_000})),
+			request("r3", SPLICE_OUT, json!({"channel_id": "abcdef01", "amount_sats": 40_000})),
 		]);
 		let (waiting, declined) = policy.sort_pending(&HashMap::new(), &conversation).unwrap();
-		assert_eq!(waiting.iter().map(|p| p.request_id.as_str()).collect::<Vec<_>>(), ["r1", "r2"]);
+		assert_eq!(
+			waiting.iter().map(|p| p.request_id.as_str()).collect::<Vec<_>>(),
+			["r1", "r2", "r3"]
+		);
 		assert!(declined.is_empty());
 		assert!(waiting[0].reason.contains("9000 ppm"));
 		assert!(waiting[1].reason.contains("50000 sats"));
+		assert!(waiting[2].reason.contains("40000 sats out of the channel"));
 
 		let decisions = HashMap::from([
 			("r1".to_string(), decision(true)),
 			("r2".to_string(), decision(false)),
+			("r3".to_string(), decision(true)),
 		]);
 		let (waiting, declined) = policy.sort_pending(&decisions, &conversation).unwrap();
 		assert!(waiting.is_empty());
@@ -330,15 +353,15 @@ mod tests {
 	}
 
 	#[test]
-	fn splice_inside_auto_limit_passes() {
+	fn splices_inside_auto_limit_pass() {
 		let bounds = PolicyBounds { max_auto_splice_sats: 100_000, ..PolicyBounds::default() };
 		let policy = Policy::new(bounds);
-		let conversation = conversation(vec![request(
-			"r1",
-			SPLICE_IN,
-			json!({"channel_id": "abcdef01", "amount_sats": 100_000}),
-		)]);
+		let conversation = conversation(vec![
+			request("r1", SPLICE_IN, json!({"channel_id": "abcdef01", "amount_sats": 100_000})),
+			request("r2", SPLICE_OUT, json!({"channel_id": "abcdef01", "amount_sats": 100_000})),
+			request("r3", SPLICE_OUT, json!({"channel_id": "abcdef01", "amount_sats": 100_001})),
+		]);
 		let (waiting, _) = policy.sort_pending(&HashMap::new(), &conversation).unwrap();
-		assert!(waiting.is_empty());
+		assert_eq!(waiting.iter().map(|p| p.request_id.as_str()).collect::<Vec<_>>(), ["r3"]);
 	}
 }

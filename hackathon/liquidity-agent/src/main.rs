@@ -77,8 +77,9 @@ Agent (env):  AGENT_PROVIDER (anthropic | databricks, default anthropic),
               AGENT_SESSION_DIR (default ./sessions)
 Watch (env):  WATCH_INTERVAL_SECS (600)
 Policy (env): POLICY_MIN_FEE_PPM (0) and POLICY_MAX_FEE_PPM (5000): fee changes in this range
-              apply without asking; POLICY_MAX_AUTO_SPLICE_SATS (0): larger splices ask.
-              Every other fund-moving action asks. Answers are recorded in the session log.
+              apply without asking; POLICY_MAX_AUTO_SPLICE_SATS (0, or DEMO_CHANNEL_SATS in
+              demo mode): splices in or out up to this size run without asking, larger ones
+              ask. Answers are recorded in the session log.
   anthropic:  ANTHROPIC_API_KEY
   databricks: DATABRICKS_HOST; signs in through the browser (OAuth) and keeps the tokens in
               DATABRICKS_TOKEN_FILE (default ~/.ldk-liquidity-agent/databricks_oauth.json);
@@ -730,7 +731,16 @@ async fn main() -> Result<()> {
 		}
 	});
 
-	let policy = Arc::new(Policy::new(PolicyBounds::from_env()?));
+	// The demo is meant to run unattended: splices up to the channel size go through on their
+	// own unless the operator sets a bound.
+	let policy_defaults = match &demo_options {
+		Some(demo_options) => PolicyBounds {
+			max_auto_splice_sats: demo_options.channel_sats,
+			..PolicyBounds::default()
+		},
+		None => PolicyBounds::default(),
+	};
+	let policy = Arc::new(Policy::new(PolicyBounds::from_env_or(policy_defaults)?));
 	let mut agent = Agent {
 		runtime: &runtime,
 		policy,
