@@ -32,7 +32,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::console::Notices;
-use crate::ledger::Ledger;
 use crate::node::{build_and_start, NodeOptions};
 
 const FUNDING_BTC: &str = "0.05";
@@ -411,36 +410,4 @@ pub fn spawn_miner(
 			}
 		}
 	})
-}
-
-/// Blocks until R has recorded a forward failure, printing progress, or until `timeout`.
-pub async fn wait_for_first_failure(
-	ledger: &Ledger, topology: &Topology, timeout: Duration, cancel: &CancellationToken,
-) {
-	let start = Instant::now();
-	let (s1, s2) = topology.sources();
-	loop {
-		let failures = ledger.recent_failures(1);
-		let forwards = ledger.recent_forwards(usize::MAX).len();
-		eprintln!(
-			"[demo] forwards {forwards}, S1 paid/failed {}/{}, S2 paid/failed {}/{}",
-			s1.paid.load(Ordering::Relaxed),
-			s1.failed.load(Ordering::Relaxed),
-			s2.paid.load(Ordering::Relaxed),
-			s2.failed.load(Ordering::Relaxed),
-		);
-		if let Some(failure) = failures.first() {
-			eprintln!("[demo] first forward failure: {}", failure.reason);
-			break;
-		}
-		if start.elapsed() > timeout {
-			eprintln!("[demo] no forward failure after {}s; reviewing anyway", timeout.as_secs());
-			break;
-		}
-		tokio::select! {
-			biased;
-			_ = cancel.cancelled() => break,
-			_ = tokio::time::sleep(Duration::from_secs(5)) => {},
-		}
-	}
 }

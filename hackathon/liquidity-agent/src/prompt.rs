@@ -27,7 +27,7 @@ How to work:
 - Be concise: state what you observed, what you recommend, and why, in that order. When you take an action, say exactly what changed.";
 
 /// Instruction appended to a snapshot in `review` mode.
-pub const REVIEW_INSTRUCTION: &str = "Review the node's liquidity. Diagnose any channel that is drained, idle, or failing forwards, and take or propose at most three concrete actions in priority order, with the expected effect of each. Apply fee changes yourself with set_channel_fees; for anything that moves funds, call the tool and let the operator decide. Use tools to check details you are unsure of.";
+pub const REVIEW_INSTRUCTION: &str = "Review the node's liquidity. Diagnose any channel that is drained, idle, or failing forwards, and take or propose at most three concrete actions in priority order, with the expected effect of each. Apply fee changes yourself with set_channel_fees; for anything that moves funds, call the tool and let the operator decide. Use tools to check details you are unsure of. If nothing needs doing, say so in a sentence and take no action. Do not repeat an action you already took or proposed earlier in this session unless the situation has changed since.";
 
 pub struct Prompt;
 

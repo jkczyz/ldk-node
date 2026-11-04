@@ -22,11 +22,13 @@ mod prompt;
 mod runtime;
 mod session;
 mod tools;
+mod watch;
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use goose_agent::events::AgentEvent;
@@ -40,6 +42,7 @@ use goose_providers::anthropic::{AnthropicProviderBuilder, ANTHROPIC_API_VERSION
 use goose_providers::api_client::{ApiClient, AuthMethod};
 use goose_providers::databricks::DatabricksProvider;
 use goose_providers::databricks_auth::DatabricksAuth;
+use ldk_node::Node;
 use tokio_util::sync::CancellationToken;
 
 use console::Notices;
@@ -49,6 +52,7 @@ use prompt::{Prompt, REVIEW_INSTRUCTION};
 use runtime::{Effect, Runtime};
 use session::{SessionMetadata, SessionStore};
 use tools::{channel_overview, render_overview};
+use watch::WatchOptions;
 
 const HELP: &str =
 	"Usage: ldk-liquidity-agent [--session-dir DIR | --resume FILE.jsonl] (review | chat [prompt] | demo)
@@ -56,14 +60,18 @@ const HELP: &str =
   review   Snapshot the node, ask the agent for a liquidity diagnosis and proposals, exit.
   chat     Interactive questions and instructions; EOF or Ctrl-C exits.
            '/tool NAME [JSON]' runs a tool yourself, bypassing the model and the policy.
+  watch    Chat, plus a review on its own every WATCH_INTERVAL_SECS and as soon as one
+           channel fails three forwards for lack of outbound liquidity within two
+           minutes. A channel with a splice pending is left alone until it locks in.
   demo     Start four regtest peers around this node, open channels, drain one with
-           traffic, then run review followed by chat; mines a block every 20s from then
-           on so splices confirm. Needs a regtest bitcoind.
+           traffic, then run watch; mines a block every 20s from then on so splices
+           confirm. Needs a regtest bitcoind.
 
 Node (env):   LDK_NETWORK LDK_STORAGE_DIR LDK_ESPLORA_URL LDK_LISTEN LDK_ALIAS
 Agent (env):  AGENT_PROVIDER (anthropic | databricks, default anthropic),
               AGENT_MODEL (default claude-opus-5-5, or goose for databricks),
               AGENT_SESSION_DIR (default ./sessions)
+Watch (env):  WATCH_INTERVAL_SECS (600)
 Policy (env): POLICY_MIN_FEE_PPM (0) and POLICY_MAX_FEE_PPM (5000): fee changes in this range
               apply without asking; POLICY_MAX_AUTO_SPLICE_SATS (0): larger splices ask.
               Every other fund-moving action asks. Answers are recorded in the session log.
@@ -77,6 +85,7 @@ Demo (env):   DEMO_BITCOIN_CLI (required, e.g. \"bitcoin-cli -regtest -rpcuser=u
 
 enum Mode {
 	Review,
+	Watch,
 	Chat { initial: Option<String> },
 	Demo,
 }
@@ -109,6 +118,7 @@ impl Options {
 		}
 		let mode = match args.next().as_deref() {
 			Some("review") => Mode::Review,
+			Some("watch") => Mode::Watch,
 			Some("demo") => Mode::Demo,
 			Some("chat") | None => {
 				let rest: Vec<_> = args.collect();
@@ -188,6 +198,8 @@ struct Agent<'a> {
 	model: ModelConfig,
 	lines: tokio::sync::mpsc::Receiver<io::Result<String>>,
 	notices: Arc<Notices>,
+	ledger: Arc<Ledger>,
+	node: Arc<Node>,
 	cancel: CancellationToken,
 }
 
@@ -278,23 +290,161 @@ async fn chat(agent: &mut Agent<'_>, initial: Option<String>) -> Result<()> {
 		let prompt = if let Some(prompt) = pending.take() {
 			prompt
 		} else {
-			eprint!("\n> ");
-			io::stderr().flush()?;
+			show_prompt()?;
 			let Some(line) = agent.read_line().await? else { break };
 			line
 		};
-		if prompt.trim().is_empty() {
-			continue;
+		handle_line(agent, prompt).await?;
+	}
+	Ok(())
+}
+
+fn show_prompt() -> io::Result<()> {
+	eprint!("\n> ");
+	io::stderr().flush()
+}
+
+/// One line from the operator: a `/tool` command, or a message for the model.
+async fn handle_line(agent: &mut Agent<'_>, line: String) -> Result<()> {
+	if line.trim().is_empty() {
+		return Ok(());
+	}
+	if let Some(rest) = line.trim().strip_prefix("/tool") {
+		return run_tool_by_hand(agent, rest).await;
+	}
+	agent.runtime.append_message(Message::user().with_text(line))?;
+	let session = agent.turn().await?;
+	if session.conversation.last().is_some_and(|message| message.error_kind().is_some()) {
+		eprintln!("Request failed. Send another message to retry.");
+	}
+	Ok(())
+}
+
+/// Settles the pending splices against the node's channels, reporting the ones that locked
+/// in or timed out. Called from the watch loop between turns, so the lines print live.
+fn settle_splices(agent: &Agent<'_>) -> ledger::SpliceSettlement {
+	let settlement = agent.ledger.settle_splices(&agent.node.list_channels());
+	for splice in &settlement.ready {
+		agent.notices.note(format!(
+			"[watch] splice on channel {} has locked in; the added balance is usable",
+			splice.channel_id
+		));
+	}
+	for splice in &settlement.timed_out {
+		agent.notices.note(format!(
+			"[watch] splice on channel {} has not confirmed after {} min; no longer waiting on it",
+			splice.channel_id,
+			ledger::SPLICE_TIMEOUT.as_secs() / 60
+		));
+	}
+	settlement
+}
+
+/// Remembers when each splice in `settlement.ready` locked in.
+fn note_locked(
+	settlement: &ledger::SpliceSettlement, recently_locked: &mut HashMap<String, Instant>,
+) {
+	for splice in &settlement.ready {
+		recently_locked.insert(splice.channel_id.clone(), Instant::now());
+	}
+}
+
+/// A sentence for the review prompt naming the channels with a splice pending, or nothing.
+fn splice_note(pending: &[ledger::PendingSplice]) -> String {
+	if pending.is_empty() {
+		return String::new();
+	}
+	let now = unix_now();
+	let list: Vec<String> = pending
+		.iter()
+		.map(|s| format!("{} (negotiated {}s ago)", s.channel_id, now.saturating_sub(s.since)))
+		.collect();
+	format!(
+		" A splice is pending on channel {}; its added balance becomes usable once it locks in, \
+		 so do not propose another splice there.",
+		list.join(", ")
+	)
+}
+
+fn unix_now() -> u64 {
+	SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Chat, plus reviews the agent starts on its own: one every `interval`, and one as soon as
+/// the ledger shows a burst of liquidity failures on a channel that has no splice pending.
+/// Runs until EOF or cancellation.
+async fn watch(agent: &mut Agent<'_>, options: WatchOptions) -> Result<()> {
+	eprintln!(
+		"Watching: a review every {}s, or sooner when a channel fails {} forwards for lack of \
+		 outbound liquidity within {}s. Type to chat; Ctrl-C or EOF exits.",
+		options.interval.as_secs(),
+		watch::BURST_THRESHOLD,
+		watch::BURST_WINDOW.as_secs()
+	);
+	// The settle time only applies once a review has happened; before that a burst is
+	// reviewed at once.
+	let started = Instant::now();
+	let mut last_review: Option<Instant> = None;
+	let mut last_review_unix = unix_now();
+	// Channels whose splice locked in recently, with when; see `watch::excluded_channels`.
+	let mut recently_locked: HashMap<String, Instant> = HashMap::new();
+	show_prompt()?;
+	loop {
+		if agent.cancel.is_cancelled() {
+			break;
 		}
-		if let Some(rest) = prompt.trim().strip_prefix("/tool") {
-			run_tool_by_hand(agent, rest).await?;
-			continue;
-		}
-		agent.runtime.append_message(Message::user().with_text(prompt))?;
-		let session = agent.turn().await?;
-		if session.conversation.last().is_some_and(|message| message.error_kind().is_some()) {
-			eprintln!("Request failed. Send another message to retry.");
-		}
+		let scheduled =
+			tokio::time::sleep_until((last_review.unwrap_or(started) + options.interval).into());
+		let trigger = tokio::select! {
+			biased;
+			line = agent.read_line() => match line? {
+				Some(line) => {
+					handle_line(agent, line).await?;
+					show_prompt()?;
+					continue;
+				},
+				None => break,
+			},
+			_ = scheduled => {
+				let settlement = settle_splices(agent);
+				note_locked(&settlement, &mut recently_locked);
+				format!(
+					"Scheduled review, {}s after the previous one.{}",
+					options.interval.as_secs(),
+					splice_note(&settlement.pending)
+				)
+			},
+			_ = tokio::time::sleep(watch::POLL_INTERVAL) => {
+				let settlement = settle_splices(agent);
+				note_locked(&settlement, &mut recently_locked);
+				let pending = settlement.pending;
+				if last_review.is_some_and(|at| at.elapsed() < watch::SETTLE_AFTER_REVIEW) {
+					continue;
+				}
+				let since = last_review_unix.max(unix_now().saturating_sub(watch::BURST_WINDOW.as_secs()));
+				let excluded = watch::excluded_channels(
+					pending.iter().map(|s| s.channel_id.clone()),
+					&mut recently_locked,
+					Instant::now(),
+				);
+				let Some((channel_id, failures)) =
+					watch::burst(&agent.ledger.stats_since(since), &excluded)
+				else {
+					continue;
+				};
+				format!(
+					"Triggered by {failures} forwards that failed for insufficient outbound \
+					 liquidity on channel {channel_id} in the last {}s.{}",
+					watch::BURST_WINDOW.as_secs(),
+					splice_note(&pending)
+				)
+			},
+		};
+		eprintln!("\n[watch] {trigger}");
+		review(agent, Some(&trigger)).await?;
+		last_review = Some(Instant::now());
+		last_review_unix = unix_now();
+		show_prompt()?;
 	}
 	Ok(())
 }
@@ -338,10 +488,13 @@ async fn run_tool_by_hand(agent: &mut Agent<'_>, rest: &str) -> Result<()> {
 	Ok(())
 }
 
-async fn review(agent: &mut Agent<'_>) -> Result<()> {
+/// One review turn. `trigger` tells the model why the review is happening, when it did not
+/// come from the operator.
+async fn review(agent: &mut Agent<'_>, trigger: Option<&str>) -> Result<()> {
 	let snapshot = render_overview(&channel_overview(&agent.runtime.snapshot(), 24));
 	eprintln!("{snapshot}");
-	let text = format!("Current node state:\n\n{snapshot}\n{REVIEW_INSTRUCTION}");
+	let trigger = trigger.map(|t| format!("{t}\n\n")).unwrap_or_default();
+	let text = format!("Current node state:\n\n{snapshot}\n{trigger}{REVIEW_INSTRUCTION}");
 	agent.runtime.append_message(Message::user().with_text(text))?;
 	agent.turn().await?;
 	Ok(())
@@ -486,11 +639,14 @@ async fn main() -> Result<()> {
 		model: ModelConfig::new(model_name),
 		lines: stdin_lines(),
 		notices: Arc::clone(&notices),
+		ledger: Arc::clone(&ledger),
+		node: Arc::clone(&node),
 		cancel: cancel.clone(),
 	};
 	let mut topology = None;
 	let result = match options.mode {
-		Mode::Review => review(&mut agent).await,
+		Mode::Review => review(&mut agent, None).await,
+		Mode::Watch => watch(&mut agent, WatchOptions::from_env()?).await,
 		Mode::Chat { initial } => chat(&mut agent, initial).await,
 		Mode::Demo => {
 			let demo_options = demo_options.expect("set for demo mode");
@@ -506,17 +662,13 @@ async fn main() -> Result<()> {
 					);
 					let _miner =
 						demo::spawn_miner(demo_options, Arc::clone(&notices), cancel.clone());
-					demo::wait_for_first_failure(
-						&ledger,
-						&built,
-						Duration::from_secs(180),
-						&cancel,
-					)
-					.await;
-					match review(&mut agent).await {
-						Ok(()) => chat(&mut agent, None).await,
-						Err(e) => Err(e),
+					// The drained channel triggers the first review; a shorter interval than
+					// the default lets the next scheduled review report the recovery.
+					let mut watch_options = WatchOptions::from_env()?;
+					if std::env::var_os("WATCH_INTERVAL_SECS").is_none() {
+						watch_options.interval = Duration::from_secs(300);
 					}
+					watch(&mut agent, watch_options).await
 				},
 				Err(e) => Err(e),
 			}

@@ -10,6 +10,7 @@
 //! only run once the policy step has let the request through.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use goose_agent::tool::ToolOperation;
@@ -19,7 +20,7 @@ use rmcp::model::ErrorData;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::ledger::{ChannelStats, FailureRecord, ForwardRecord};
+use crate::ledger::{ChannelStats, FailureRecord, ForwardRecord, PendingSplice};
 use crate::session::Session;
 
 /// Tools that change the node. The policy step gates these by name.
@@ -128,6 +129,9 @@ pub struct ChannelRow {
 	pub fee_base_msat: u32,
 	pub fee_ppm: u32,
 	pub cltv_expiry_delta: u16,
+	/// A splice we negotiated on this channel that has not locked in yet. Do not propose
+	/// another splice while one is pending.
+	pub pending_splice: Option<PendingSplice>,
 	pub stats: ChannelStats,
 }
 
@@ -143,9 +147,15 @@ pub fn channel_overview(session: &Session, window_hours: u64) -> ChannelOverview
 	let since = now_secs().saturating_sub(window_hours * 3600);
 	let mut stats = session.ledger.stats_since(since);
 	let balances = session.node.list_balances();
-	let channels = session
-		.node
-		.list_channels()
+	let details = session.node.list_channels();
+	let mut pending_splices: HashMap<String, PendingSplice> = session
+		.ledger
+		.settle_splices(&details)
+		.pending
+		.into_iter()
+		.map(|s| (s.channel_id.clone(), s))
+		.collect();
+	let channels = details
 		.into_iter()
 		.map(|c| {
 			let channel_id = c.channel_id.to_string();
@@ -158,6 +168,7 @@ pub fn channel_overview(session: &Session, window_hours: u64) -> ChannelOverview
 			};
 			ChannelRow {
 				stats: stats.remove(&channel_id).unwrap_or_default(),
+				pending_splice: pending_splices.remove(&channel_id),
 				channel_id,
 				user_channel_id: c.user_channel_id.0.to_string(),
 				counterparty_node_id: c.counterparty.node_id.to_string(),
@@ -191,10 +202,10 @@ pub fn render_overview(o: &ChannelOverviewOutput) -> String {
 		"on-chain spendable: {} sats; lightning total: {} sats; stats window: {}h\n\n",
 		o.spendable_onchain_sats, o.total_lightning_sats, o.window_hours
 	));
-	out.push_str("channel | peer | cap sats | local% | local sats | remote sats | fee base/ppm | fwd in/out | fees msat | fail out (liq) | usable\n");
+	out.push_str("channel | peer | cap sats | local% | local sats | remote sats | fee base/ppm | fwd in/out | fees msat | fail out (liq) | usable | splice\n");
 	for c in &o.channels {
 		out.push_str(&format!(
-			"{} | {} | {} | {}% | {} | {} | {}/{} | {}/{} | {} | {} ({}) | {}\n",
+			"{} | {} | {} | {}% | {} | {} | {}/{} | {}/{} | {} | {} ({}) | {} | {}\n",
 			&c.channel_id[..8.min(c.channel_id.len())],
 			&c.counterparty_node_id[..8.min(c.counterparty_node_id.len())],
 			c.capacity_sats,
@@ -209,6 +220,7 @@ pub fn render_overview(o: &ChannelOverviewOutput) -> String {
 			c.stats.failures_out,
 			c.stats.liquidity_failures_out,
 			c.is_usable,
+			if c.pending_splice.is_some() { "pending" } else { "-" },
 		));
 	}
 	out

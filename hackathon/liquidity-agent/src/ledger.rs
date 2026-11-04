@@ -10,9 +10,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ldk_node::{Event, ForwardFailureReason, Node};
+use ldk_node::{ChannelDetails, Event, ForwardFailureReason, Node};
 use schemars::JsonSchema;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
@@ -21,6 +21,8 @@ use crate::console::Notices;
 
 /// Oldest entries are dropped past this many records per kind.
 const CAPACITY: usize = 10_000;
+/// A negotiated splice that has not locked in after this long is no longer treated as pending.
+pub const SPLICE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct ForwardRecord {
@@ -41,6 +43,26 @@ pub struct FailureRecord {
 	pub next_channel_id: Option<String>,
 	pub next_node_id: Option<String>,
 	pub reason: String,
+}
+
+/// A splice we negotiated whose funding transaction has not locked in yet.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct PendingSplice {
+	pub channel_id: String,
+	/// The splice funding outpoint; the channel's `funding_txo` moves to it once locked in.
+	pub new_funding_txo: String,
+	/// Unix timestamp (seconds) when the splice was negotiated.
+	pub since: u64,
+}
+
+/// What [`Ledger::settle_splices`] found.
+#[derive(Default)]
+pub struct SpliceSettlement {
+	/// Locked in since the last check: the added balance is usable now.
+	pub ready: Vec<PendingSplice>,
+	/// Still unconfirmed after [`SPLICE_TIMEOUT`]; no longer tracked.
+	pub timed_out: Vec<PendingSplice>,
+	pub pending: Vec<PendingSplice>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, JsonSchema)]
@@ -65,6 +87,8 @@ pub struct ChannelStats {
 struct Inner {
 	forwards: VecDeque<ForwardRecord>,
 	failures: VecDeque<FailureRecord>,
+	/// By channel id.
+	pending_splices: HashMap<String, PendingSplice>,
 }
 
 #[derive(Default)]
@@ -88,7 +112,7 @@ impl Ledger {
 		Self::default()
 	}
 
-	/// Records the event if it is forwarding-related. Returns whether it was recorded.
+	/// Records the event if it is forwarding- or splice-related. Returns whether it was recorded.
 	pub fn record(&self, event: &Event) -> bool {
 		match event {
 			Event::PaymentForwarded {
@@ -122,6 +146,20 @@ impl Ledger {
 				push_capped(&mut self.inner.lock().unwrap().failures, record);
 				true
 			},
+			Event::SpliceNegotiated { channel_id, new_funding_txo, .. } => {
+				let channel_id = channel_id.to_string();
+				let pending = PendingSplice {
+					channel_id: channel_id.clone(),
+					new_funding_txo: new_funding_txo.to_string(),
+					since: now_secs(),
+				};
+				self.inner.lock().unwrap().pending_splices.insert(channel_id, pending);
+				true
+			},
+			Event::SpliceNegotiationFailed { channel_id, .. } => {
+				self.inner.lock().unwrap().pending_splices.remove(&channel_id.to_string());
+				true
+			},
 			_ => false,
 		}
 	}
@@ -151,6 +189,33 @@ impl Ledger {
 			}
 		}
 		stats
+	}
+
+	/// Checks the pending splices against the node's current channels: a splice whose outpoint
+	/// is now the channel's funding outpoint has locked in, and one older than
+	/// [`SPLICE_TIMEOUT`] is given up on. Both are dropped and reported; the rest stay pending.
+	pub fn settle_splices(&self, channels: &[ChannelDetails]) -> SpliceSettlement {
+		let mut inner = self.inner.lock().unwrap();
+		let now = now_secs();
+		let mut settlement = SpliceSettlement::default();
+		inner.pending_splices.retain(|channel_id, splice| {
+			let locked_in = channels.iter().any(|c| {
+				c.channel_id.to_string() == *channel_id
+					&& c.funding_txo.is_some_and(|txo| txo.to_string() == splice.new_funding_txo)
+			});
+			if locked_in {
+				settlement.ready.push(splice.clone());
+				false
+			} else if now.saturating_sub(splice.since) > SPLICE_TIMEOUT.as_secs() {
+				settlement.timed_out.push(splice.clone());
+				false
+			} else {
+				settlement.pending.push(splice.clone());
+				true
+			}
+		});
+		settlement.pending.sort_by(|a, b| a.since.cmp(&b.since));
+		settlement
 	}
 
 	pub fn recent_forwards(&self, limit: usize) -> Vec<ForwardRecord> {
@@ -185,6 +250,11 @@ pub fn spawn_event_drain(
 					Event::ForwardFailed { reason, .. } => {
 						notices.note(format!("[node] forward failed: {reason:?}"))
 					},
+					Event::SpliceNegotiated { channel_id, .. } => notices.note(format!(
+						"[node] splice negotiated on channel {channel_id}; waiting for it to confirm"
+					)),
+					Event::SpliceNegotiationFailed { channel_id, .. } => notices
+						.note(format!("[node] splice negotiation failed on channel {channel_id}")),
 					_ => {},
 				}
 			} else {
