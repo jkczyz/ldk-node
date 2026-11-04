@@ -323,6 +323,41 @@ pub enum Event {
 		/// Why the forward failed.
 		reason: ForwardFailureReason,
 	},
+	/// A payment probe reached its destination: every channel on the path could carry the
+	/// amount at the time.
+	///
+	/// Probes are sent by the background prober (see [`crate::probing`]) and by the
+	/// `send_probes` methods of the payment handlers. No funds move either way.
+	ProbeSucceeded {
+		/// The id returned when the probe was sent.
+		payment_id: PaymentId,
+		/// The node id of each hop on the path, in order; the last one is the destination.
+		hops: Vec<PublicKey>,
+		/// The short channel id used to reach each hop, in the same order.
+		short_channel_ids: Vec<u64>,
+		/// The amount the probe carried to the destination, in millisatoshis.
+		amount_msat: u64,
+		/// The fees the path would have charged, in millisatoshis.
+		fee_msat: u64,
+	},
+	/// A payment probe failed somewhere along its path.
+	///
+	/// See [`Event::ProbeSucceeded`].
+	ProbeFailed {
+		/// The id returned when the probe was sent.
+		payment_id: PaymentId,
+		/// The node id of each hop on the path, in order; the last one is the destination.
+		hops: Vec<PublicKey>,
+		/// The short channel id used to reach each hop, in the same order.
+		short_channel_ids: Vec<u64>,
+		/// The amount the probe tried to carry to the destination, in millisatoshis.
+		amount_msat: u64,
+		/// The fees the path would have charged, in millisatoshis.
+		fee_msat: u64,
+		/// The channel that failed the probe, if known. For the first hop this may be an SCID
+		/// alias rather than the channel's public short channel id.
+		failed_short_channel_id: Option<u64>,
+	},
 }
 
 /// The reason an HTLC forward failed, as reported by [`Event::ForwardFailed`].
@@ -475,6 +510,21 @@ impl_writeable_tlv_based_enum!(Event,
 		(3, next_channel_id, option),
 		(5, next_node_id, option),
 		(7, reason, required),
+	},
+	(11, ProbeSucceeded) => {
+		(1, payment_id, required),
+		(3, hops, required_vec),
+		(5, short_channel_ids, required_vec),
+		(7, amount_msat, required),
+		(9, fee_msat, required),
+	},
+	(12, ProbeFailed) => {
+		(1, payment_id, required),
+		(3, hops, required_vec),
+		(5, short_channel_ids, required_vec),
+		(7, amount_msat, required),
+		(9, fee_msat, required),
+		(11, failed_short_channel_id, option),
 	},
 );
 
@@ -1579,11 +1629,34 @@ where
 				if let Some(prober) = &self.prober {
 					prober.handle_background_probe_successful(&path, payment_id);
 				}
+				let event = Event::ProbeSucceeded {
+					payment_id,
+					hops: path.hops.iter().map(|hop| hop.pubkey).collect(),
+					short_channel_ids: path.hops.iter().map(|hop| hop.short_channel_id).collect(),
+					amount_msat: path.final_value_msat(),
+					fee_msat: path.fee_msat(),
+				};
+				self.event_queue.add_event(event).await.map_err(|e| {
+					log_error!(self.logger, "Failed to push to event queue: {}", e);
+					ReplayEvent()
+				})?;
 			},
-			LdkEvent::ProbeFailed { path, payment_id, .. } => {
+			LdkEvent::ProbeFailed { path, payment_id, short_channel_id, .. } => {
 				if let Some(prober) = &self.prober {
 					prober.handle_background_probe_failed(&path, payment_id);
 				}
+				let event = Event::ProbeFailed {
+					payment_id,
+					hops: path.hops.iter().map(|hop| hop.pubkey).collect(),
+					short_channel_ids: path.hops.iter().map(|hop| hop.short_channel_id).collect(),
+					amount_msat: path.final_value_msat(),
+					fee_msat: path.fee_msat(),
+					failed_short_channel_id: short_channel_id,
+				};
+				self.event_queue.add_event(event).await.map_err(|e| {
+					log_error!(self.logger, "Failed to push to event queue: {}", e);
+					ReplayEvent()
+				})?;
 			},
 			LdkEvent::HTLCHandlingFailed { prev_channel_ids, failure_type, failure_reason } => {
 				let (next_channel_id, next_node_id, unknown_next_hop) = match &failure_type {
