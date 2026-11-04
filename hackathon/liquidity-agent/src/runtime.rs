@@ -18,7 +18,9 @@ use goose_agent::operation::{Emitter, MachineEffect};
 use goose_provider_types::conversation::message::Message;
 use goose_provider_types::conversation::token_usage::ProviderUsage;
 
-use crate::session::{Record, Session, SessionStore};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::session::{Decision, Record, Session, SessionStore};
 
 /// Everything a machine pass can produce. Each variant maps to one persisted record.
 pub enum Effect {
@@ -51,6 +53,15 @@ pub struct Runtime(pub Mutex<SessionStore>);
 impl Runtime {
 	pub fn snapshot(&self) -> Session {
 		self.0.lock().unwrap().session.clone()
+	}
+
+	/// Persists the operator's answer to a proposed action before the machine runs again.
+	pub fn record_decision(
+		&self, request_id: String, tool: String, summary: String, approved: bool,
+	) -> Result<()> {
+		let at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+		let decision = Decision { tool, summary, approved, at };
+		self.0.lock().unwrap().append(vec![Record::Decision { request_id, decision }])
 	}
 
 	pub fn append_message(&self, message: Message) -> Result<()> {

@@ -345,6 +345,7 @@ pub fn spawn_traffic(
 ) -> JoinHandle<()> {
 	tokio::spawn(async move {
 		let mut tick: u64 = 0;
+		let mut consecutive_failures: u32 = 0;
 		loop {
 			if cancel.is_cancelled() {
 				break;
@@ -355,9 +356,20 @@ pub fn spawn_traffic(
 				(&topology.peers[0], &topology.peers[2], options.payment_sats)
 			};
 			let delay = match pay(source, destination, sats).await {
-				Ok(true) => Duration::from_millis(1500),
-				// Keep failing slowly so the ledger keeps seeing the failures.
-				Ok(false) => Duration::from_secs(5),
+				Ok(true) => {
+					consecutive_failures = 0;
+					Duration::from_millis(1500)
+				},
+				Ok(false) => {
+					consecutive_failures += 1;
+					// A few quick failures make the drain visible; after that, slow down so
+					// the operator's chat is not flooded with the same failure.
+					if consecutive_failures <= 3 {
+						Duration::from_secs(5)
+					} else {
+						Duration::from_secs(45)
+					}
+				},
 				Err(e) => {
 					eprintln!("[traffic] {e}");
 					Duration::from_secs(3)

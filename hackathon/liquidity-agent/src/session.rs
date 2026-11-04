@@ -8,6 +8,7 @@
 //! Append-only session storage. The JSONL log is authoritative; memory is a replayed view.
 //! The log doubles as the audit trail of what the agent saw, proposed, and was allowed to do.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -56,8 +57,20 @@ pub struct Session {
 	pub metadata: SessionMetadata,
 	pub conversation: Conversation,
 	pub usage: Vec<ProviderUsage>,
+	/// Operator decisions on proposed actions, by tool request id. Read by the policy step.
+	pub decisions: HashMap<String, Decision>,
 	pub node: Arc<Node>,
 	pub ledger: Arc<Ledger>,
+}
+
+/// What the operator said to a proposed action, and what was proposed, so the log reads on
+/// its own.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Decision {
+	pub tool: String,
+	pub summary: String,
+	pub approved: bool,
+	pub at: u64,
 }
 
 impl MachineSession for Session {
@@ -78,6 +91,7 @@ pub enum Record {
 	Metadata { metadata: SessionMetadata },
 	Message { message: Message },
 	Usage { usage: ProviderUsage },
+	Decision { request_id: String, decision: Decision },
 }
 
 impl Session {
@@ -86,6 +100,9 @@ impl Session {
 			Record::Metadata { metadata } => self.metadata = metadata,
 			Record::Message { message } => self.conversation.push(message),
 			Record::Usage { usage } => self.usage.push(usage),
+			Record::Decision { request_id, decision } => {
+				self.decisions.insert(request_id, decision);
+			},
 			Record::Created { .. } => unreachable!("creation is only valid as the first record"),
 		}
 	}
@@ -140,6 +157,7 @@ impl SessionStore {
 				metadata,
 				conversation: Conversation::empty(),
 				usage: Vec::new(),
+				decisions: HashMap::new(),
 				node,
 				ledger,
 			},
@@ -249,6 +267,7 @@ fn replay(file: &File, node: Arc<Node>, ledger: Arc<Ledger>) -> Result<Session> 
 				metadata,
 				conversation: Conversation::empty(),
 				usage: Vec::new(),
+				decisions: HashMap::new(),
 				node: Arc::clone(&node),
 				ledger: Arc::clone(&ledger),
 			});

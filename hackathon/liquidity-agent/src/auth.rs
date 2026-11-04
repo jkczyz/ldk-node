@@ -107,13 +107,32 @@ pub fn default_token_path() -> Result<PathBuf> {
 	Ok(PathBuf::from(home).join(".ldk-liquidity-agent").join("databricks_oauth.json"))
 }
 
-struct Login {
+pub struct Login {
 	path: PathBuf,
 	http: reqwest::Client,
 	tokens: Mutex<Option<Tokens>>,
 }
 
+/// The OAuth client goose and the Databricks CLI use, which every workspace knows.
+const CLIENT_ID: &str = "databricks-cli";
+const REDIRECT_URL: &str = "http://localhost";
+const SCOPES: [&str; 2] = ["all-apis", "offline_access"];
+
 impl Login {
+	pub fn new(path: PathBuf) -> Self {
+		Self { path, http: reqwest::Client::new(), tokens: Mutex::new(None) }
+	}
+
+	/// Signs in now if the cached tokens are missing or stale, so the browser step happens
+	/// up front and never inside a model request, which the provider may time out and retry
+	/// while the redirect listener is still waiting.
+	pub async fn ensure_signed_in(&self, host: &str) -> Result<()> {
+		let scopes = SCOPES.iter().map(|s| s.to_string()).collect();
+		self.access_token(host.to_string(), CLIENT_ID.to_string(), REDIRECT_URL.to_string(), scopes)
+			.await
+			.map(|_| ())
+	}
+
 	fn load(&self) -> Option<Tokens> {
 		let bytes = std::fs::read(&self.path).ok()?;
 		serde_json::from_slice(&bytes).ok()
@@ -331,8 +350,7 @@ fn wait_for_redirect(listener: TcpListener, expected_state: &str) -> Result<Stri
 }
 
 /// The closure the GDK's Databricks provider calls for a bearer token.
-pub fn token_provider(path: PathBuf) -> DatabricksOauthTokenProvider {
-	let login = Arc::new(Login { path, http: reqwest::Client::new(), tokens: Mutex::new(None) });
+pub fn token_provider(login: Arc<Login>) -> DatabricksOauthTokenProvider {
 	Arc::new(move |host, client_id, redirect_url, scopes| {
 		let login = Arc::clone(&login);
 		Box::pin(async move { login.access_token(host, client_id, redirect_url, scopes).await })

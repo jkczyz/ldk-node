@@ -5,13 +5,15 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-//! Read-only tools over the node. Each tool is a typed [`AsyncTool`] registered on the GDK
-//! tool operation. Fund-moving tools live behind the policy step and are added separately.
+//! Tools over the node. Each tool is a typed [`AsyncTool`] registered on the GDK tool
+//! operation. The read tools are always available; the write tools listed in [`WRITE_TOOLS`]
+//! only run once the policy step has let the request through.
 
 use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use goose_agent::tool::ToolOperation;
+use ldk_node::ChannelDetails;
 use rmcp::handler::server::router::tool::{AsyncTool, ToolBase};
 use rmcp::model::ErrorData;
 use schemars::JsonSchema;
@@ -20,12 +22,76 @@ use serde::{Deserialize, Serialize};
 use crate::ledger::{ChannelStats, FailureRecord, ForwardRecord};
 use crate::session::Session;
 
+/// Tools that change the node. The policy step gates these by name.
+pub const WRITE_TOOLS: &[&str] = &[SET_CHANNEL_FEES, SPLICE_IN];
+pub const TOOL_NAMES: &[&str] = &[
+	"channel_overview",
+	"recent_forwards",
+	"forward_failures",
+	"node_info",
+	SET_CHANNEL_FEES,
+	SPLICE_IN,
+];
+pub const SET_CHANNEL_FEES: &str = "set_channel_fees";
+pub const SPLICE_IN: &str = "splice_in";
+
 pub fn tool_operation() -> ToolOperation<Session> {
 	ToolOperation::<Session>::new()
 		.with_async_tool::<ChannelOverview>()
 		.with_async_tool::<RecentForwards>()
 		.with_async_tool::<ForwardFailures>()
 		.with_async_tool::<NodeInfo>()
+		.with_async_tool::<SetChannelFees>()
+		.with_async_tool::<SpliceIn>()
+}
+
+/// Runs a tool by name outside the machine, for the operator's own `/tool` command. The policy
+/// step is not involved: the operator typing the command is the approval.
+pub async fn run_by_name(
+	session: &Session, name: &str, arguments: serde_json::Value,
+) -> Result<serde_json::Value, ErrorData> {
+	fn parse<T: for<'de> Deserialize<'de>>(arguments: serde_json::Value) -> Result<T, ErrorData> {
+		serde_json::from_value(arguments)
+			.map_err(|e| ErrorData::invalid_params(format!("bad arguments: {e}"), None))
+	}
+	fn json<T: Serialize>(output: T) -> Result<serde_json::Value, ErrorData> {
+		serde_json::to_value(output)
+			.map_err(|e| ErrorData::internal_error(format!("serialize output: {e}"), None))
+	}
+	match name {
+		"channel_overview" => json(ChannelOverview::invoke(session, parse(arguments)?).await?),
+		"recent_forwards" => json(RecentForwards::invoke(session, parse(arguments)?).await?),
+		"forward_failures" => json(ForwardFailures::invoke(session, parse(arguments)?).await?),
+		"node_info" => json(NodeInfo::invoke(session, parse(arguments)?).await?),
+		SET_CHANNEL_FEES => json(SetChannelFees::invoke(session, parse(arguments)?).await?),
+		SPLICE_IN => json(SpliceIn::invoke(session, parse(arguments)?).await?),
+		other => Err(ErrorData::invalid_params(format!("unknown tool {other}"), None)),
+	}
+}
+
+/// Looks a channel up by its full id or a unique prefix of at least six hex characters.
+fn find_channel(session: &Session, channel_id: &str) -> Result<ChannelDetails, ErrorData> {
+	let wanted = channel_id.trim().to_ascii_lowercase();
+	if wanted.len() < 6 {
+		return Err(ErrorData::invalid_params(
+			"channel_id must be the full channel id or a prefix of at least 6 characters",
+			None,
+		));
+	}
+	let mut matches: Vec<ChannelDetails> = session
+		.node
+		.list_channels()
+		.into_iter()
+		.filter(|c| c.channel_id.to_string().starts_with(&wanted))
+		.collect();
+	match matches.len() {
+		1 => Ok(matches.remove(0)),
+		0 => Err(ErrorData::invalid_params(format!("no channel matches {channel_id}"), None)),
+		n => Err(ErrorData::invalid_params(
+			format!("{n} channels match {channel_id}; give more of the id"),
+			None,
+		)),
+	}
 }
 
 fn now_secs() -> u64 {
@@ -315,6 +381,131 @@ impl AsyncTool<Session> for NodeInfo {
 					is_connected: p.is_connected,
 				})
 				.collect(),
+		})
+	}
+}
+
+// ---- set_channel_fees --------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct SetChannelFeesInput {
+	/// Channel id (or unique prefix) from channel_overview.
+	pub channel_id: String,
+	/// New proportional fee in parts per million of the forwarded amount. Unchanged if omitted.
+	pub fee_ppm: Option<u32>,
+	/// New base fee in millisatoshis per forward. Unchanged if omitted.
+	pub fee_base_msat: Option<u32>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct FeePolicy {
+	pub fee_base_msat: u32,
+	pub fee_ppm: u32,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SetChannelFeesOutput {
+	pub channel_id: String,
+	pub counterparty_node_id: String,
+	pub previous: FeePolicy,
+	pub current: FeePolicy,
+}
+
+pub struct SetChannelFees;
+
+impl ToolBase for SetChannelFees {
+	type Parameter = SetChannelFeesInput;
+	type Output = SetChannelFeesOutput;
+	type Error = ErrorData;
+
+	fn name() -> Cow<'static, str> {
+		SET_CHANNEL_FEES.into()
+	}
+
+	fn description() -> Option<Cow<'static, str>> {
+		Some("Change the forwarding fee we charge for HTLCs leaving over one channel: the proportional fee in ppm and/or the base fee in msat. Raising the fee on a draining channel slows the drain; lowering it on an idle channel attracts flow. Changes inside the operator policy apply immediately; others wait for the operator's approval.".into())
+	}
+}
+
+impl AsyncTool<Session> for SetChannelFees {
+	async fn invoke(
+		session: &Session, input: SetChannelFeesInput,
+	) -> Result<SetChannelFeesOutput, ErrorData> {
+		let channel = find_channel(session, &input.channel_id)?;
+		let previous = FeePolicy {
+			fee_base_msat: channel.config.forwarding_fee_base_msat,
+			fee_ppm: channel.config.forwarding_fee_proportional_millionths,
+		};
+		let mut config = channel.config;
+		if let Some(ppm) = input.fee_ppm {
+			config.forwarding_fee_proportional_millionths = ppm;
+		}
+		if let Some(base) = input.fee_base_msat {
+			config.forwarding_fee_base_msat = base;
+		}
+		session
+			.node
+			.update_channel_config(&channel.user_channel_id, channel.counterparty.node_id, config)
+			.map_err(|e| ErrorData::internal_error(format!("fee update failed: {e}"), None))?;
+		Ok(SetChannelFeesOutput {
+			channel_id: channel.channel_id.to_string(),
+			counterparty_node_id: channel.counterparty.node_id.to_string(),
+			previous,
+			current: FeePolicy {
+				fee_base_msat: config.forwarding_fee_base_msat,
+				fee_ppm: config.forwarding_fee_proportional_millionths,
+			},
+		})
+	}
+}
+
+// ---- splice_in ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct SpliceInInput {
+	/// Channel id (or unique prefix) from channel_overview.
+	pub channel_id: String,
+	/// On-chain satoshis to add to our side of the channel.
+	pub amount_sats: u64,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SpliceInOutput {
+	pub channel_id: String,
+	pub amount_sats: u64,
+	pub status: String,
+}
+
+pub struct SpliceIn;
+
+impl ToolBase for SpliceIn {
+	type Parameter = SpliceInInput;
+	type Output = SpliceInOutput;
+	type Error = ErrorData;
+
+	fn name() -> Cow<'static, str> {
+		SPLICE_IN.into()
+	}
+
+	fn description() -> Option<Cow<'static, str>> {
+		Some("Add on-chain funds to our side of an existing channel without closing it, increasing its outbound liquidity. Spends from the node's on-chain wallet (see spendable_onchain_sats) and pays a transaction fee. The new balance becomes usable once the splice transaction confirms. Waits for the operator's approval unless inside the policy's auto-splice limit.".into())
+	}
+}
+
+impl AsyncTool<Session> for SpliceIn {
+	async fn invoke(session: &Session, input: SpliceInInput) -> Result<SpliceInOutput, ErrorData> {
+		if input.amount_sats == 0 {
+			return Err(ErrorData::invalid_params("amount_sats must be positive", None));
+		}
+		let channel = find_channel(session, &input.channel_id)?;
+		session
+			.node
+			.splice_in(&channel.user_channel_id, channel.counterparty.node_id, input.amount_sats)
+			.map_err(|e| ErrorData::internal_error(format!("splice failed: {e}"), None))?;
+		Ok(SpliceInOutput {
+			channel_id: channel.channel_id.to_string(),
+			amount_sats: input.amount_sats,
+			status: "splice negotiated; the added balance is usable once the splice transaction confirms".into(),
 		})
 	}
 }

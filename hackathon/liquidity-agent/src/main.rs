@@ -42,7 +42,7 @@ use goose_providers::databricks_auth::DatabricksAuth;
 use tokio_util::sync::CancellationToken;
 
 use ledger::Ledger;
-use policy::{Policy, PolicyBounds};
+use policy::{Policy, PolicyBounds, Proposal};
 use prompt::{Prompt, REVIEW_INSTRUCTION};
 use runtime::{Effect, Runtime};
 use session::{SessionMetadata, SessionStore};
@@ -53,6 +53,7 @@ const HELP: &str =
 
   review   Snapshot the node, ask the agent for a liquidity diagnosis and proposals, exit.
   chat     Interactive questions and instructions; EOF or Ctrl-C exits.
+           '/tool NAME [JSON]' runs a tool yourself, bypassing the model and the policy.
   demo     Start four regtest peers around this node, open channels, drain one with
            traffic, then run review followed by chat. Needs a regtest bitcoind.
 
@@ -60,6 +61,9 @@ Node (env):   LDK_NETWORK LDK_STORAGE_DIR LDK_ESPLORA_URL LDK_LISTEN LDK_ALIAS
 Agent (env):  AGENT_PROVIDER (anthropic | databricks, default anthropic),
               AGENT_MODEL (default claude-opus-5-5, or goose for databricks),
               AGENT_SESSION_DIR (default ./sessions)
+Policy (env): POLICY_MIN_FEE_PPM (0) and POLICY_MAX_FEE_PPM (5000): fee changes in this range
+              apply without asking; POLICY_MAX_AUTO_SPLICE_SATS (0): larger splices ask.
+              Every other fund-moving action asks. Answers are recorded in the session log.
   anthropic:  ANTHROPIC_API_KEY
   databricks: DATABRICKS_HOST; signs in through the browser (OAuth) and keeps the tokens in
               DATABRICKS_TOKEN_FILE (default ~/.ldk-liquidity-agent/databricks_oauth.json);
@@ -117,11 +121,11 @@ impl Options {
 }
 
 fn agent(
-	provider: Arc<dyn Provider>, model: ModelConfig, cancel: CancellationToken,
+	policy: Arc<Policy>, provider: Arc<dyn Provider>, model: ModelConfig, cancel: CancellationToken,
 ) -> StateMachine<'static, session::Session, Effect> {
 	StateMachine::new(
 		vec![
-			Step::Operation(Arc::new(Policy::new(PolicyBounds::default()))),
+			Step::Operation(policy),
 			Step::Operation(Arc::new(tools::tool_operation())),
 			Step::Inference(Arc::new(
 				InferenceRunner::<session::Session, Effect>::new(provider, model)
@@ -134,7 +138,8 @@ fn agent(
 
 /// Runs the machine over the stored session until it yields, streaming assistant text.
 async fn run_turn(
-	runtime: &Runtime, provider: Arc<dyn Provider>, model: ModelConfig, cancel: CancellationToken,
+	runtime: &Runtime, policy: Arc<Policy>, provider: Arc<dyn Provider>, model: ModelConfig,
+	cancel: CancellationToken,
 ) -> Result<session::Session> {
 	let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 	let emitter = Emitter::new(tx, cancel.clone());
@@ -162,13 +167,81 @@ async fn run_turn(
 		println!();
 		Ok::<_, io::Error>(())
 	});
-	let machine = agent(provider, model, cancel);
+	let machine = agent(policy, provider, model, cancel);
 	let id = runtime.snapshot().id;
 	// Await the run even on cancellation so the GDK can finalize tool responses.
 	let result = machine.run(runtime, &id, &emitter).await;
 	drop(emitter);
 	display.await??;
 	result
+}
+
+/// What every turn needs: the session, the policy, the model, and one reader over stdin (a
+/// second reader would race the first for lines).
+struct Agent<'a> {
+	runtime: &'a Runtime,
+	policy: Arc<Policy>,
+	provider: Arc<dyn Provider>,
+	model: ModelConfig,
+	lines: tokio::sync::mpsc::Receiver<io::Result<String>>,
+	cancel: CancellationToken,
+}
+
+impl Agent<'_> {
+	/// Reads one line from the operator, or `None` on EOF or cancellation.
+	async fn read_line(&mut self) -> Result<Option<String>> {
+		let line = tokio::select! {
+			biased;
+			_ = self.cancel.cancelled() => return Ok(None),
+			line = self.lines.recv() => line,
+		};
+		Ok(line.transpose()?)
+	}
+
+	/// Runs the machine, and whenever it stops for the operator's decision on a proposed
+	/// action, asks on the terminal, records the answer, and runs again. EOF declines.
+	async fn turn(&mut self) -> Result<session::Session> {
+		loop {
+			let session = run_turn(
+				self.runtime,
+				Arc::clone(&self.policy),
+				Arc::clone(&self.provider),
+				self.model.clone(),
+				self.cancel.clone(),
+			)
+			.await?;
+			if self.cancel.is_cancelled() {
+				return Ok(session);
+			}
+			let proposals = self.policy.pending_decisions(&session)?;
+			if proposals.is_empty() {
+				return Ok(session);
+			}
+			for proposal in proposals {
+				let approved = self.ask(&proposal).await?;
+				eprintln!("[policy] {}", if approved { "approved" } else { "declined" });
+				self.runtime.record_decision(
+					proposal.request_id,
+					proposal.tool,
+					proposal.summary,
+					approved,
+				)?;
+			}
+		}
+	}
+
+	async fn ask(&mut self, proposal: &Proposal) -> Result<bool> {
+		loop {
+			eprint!("\n{}\nApprove? [y/N] ", proposal.render());
+			io::stderr().flush()?;
+			let Some(line) = self.read_line().await? else { return Ok(false) };
+			match line.trim().to_ascii_lowercase().as_str() {
+				"y" | "yes" => return Ok(true),
+				"" | "n" | "no" => return Ok(false),
+				_ => eprintln!("Answer y or n."),
+			}
+		}
+	}
 }
 
 fn stdin_lines() -> tokio::sync::mpsc::Receiver<io::Result<String>> {
@@ -184,14 +257,10 @@ fn stdin_lines() -> tokio::sync::mpsc::Receiver<io::Result<String>> {
 	rx
 }
 
-async fn chat(
-	runtime: &Runtime, provider: Arc<dyn Provider>, model: ModelConfig, initial: Option<String>,
-	cancel: CancellationToken,
-) -> Result<()> {
-	let mut lines = stdin_lines();
+async fn chat(agent: &mut Agent<'_>, initial: Option<String>) -> Result<()> {
 	let mut pending = initial;
 	loop {
-		if cancel.is_cancelled() {
+		if agent.cancel.is_cancelled() {
 			break;
 		}
 		let prompt = if let Some(prompt) = pending.take() {
@@ -199,19 +268,18 @@ async fn chat(
 		} else {
 			eprint!("\n> ");
 			io::stderr().flush()?;
-			let line = tokio::select! {
-				biased;
-				_ = cancel.cancelled() => break,
-				line = lines.recv() => line,
-			};
-			let Some(line) = line else { break };
-			line?
+			let Some(line) = agent.read_line().await? else { break };
+			line
 		};
 		if prompt.trim().is_empty() {
 			continue;
 		}
-		runtime.append_message(Message::user().with_text(prompt))?;
-		let session = run_turn(runtime, provider.clone(), model.clone(), cancel.clone()).await?;
+		if let Some(rest) = prompt.trim().strip_prefix("/tool") {
+			run_tool_by_hand(agent, rest).await?;
+			continue;
+		}
+		agent.runtime.append_message(Message::user().with_text(prompt))?;
+		let session = agent.turn().await?;
 		if session.conversation.last().is_some_and(|message| message.error_kind().is_some()) {
 			eprintln!("Request failed. Send another message to retry.");
 		}
@@ -219,14 +287,51 @@ async fn chat(
 	Ok(())
 }
 
-async fn review(
-	runtime: &Runtime, provider: Arc<dyn Provider>, model: ModelConfig, cancel: CancellationToken,
-) -> Result<()> {
-	let snapshot = render_overview(&channel_overview(&runtime.snapshot(), 24));
+/// `/tool NAME [JSON]`: runs a tool directly, prints the result, and tells the model what the
+/// operator did so the next turn can build on it.
+async fn run_tool_by_hand(agent: &mut Agent<'_>, rest: &str) -> Result<()> {
+	let rest = rest.trim();
+	let (name, arguments) = match rest.split_once(char::is_whitespace) {
+		Some((name, arguments)) => (name, arguments.trim()),
+		None => (rest, ""),
+	};
+	if name.is_empty() {
+		eprintln!("usage: /tool NAME [JSON]; tools: {}", tools::TOOL_NAMES.join(", "));
+		return Ok(());
+	}
+	let arguments: serde_json::Value = if arguments.is_empty() {
+		serde_json::json!({})
+	} else {
+		match serde_json::from_str(arguments) {
+			Ok(value) => value,
+			Err(e) => {
+				eprintln!("arguments must be JSON: {e}");
+				return Ok(());
+			},
+		}
+	};
+	let session = agent.runtime.snapshot();
+	let note = match tools::run_by_name(&session, name, arguments.clone()).await {
+		Ok(output) => {
+			let pretty = serde_json::to_string_pretty(&output)?;
+			println!("{pretty}");
+			format!("Operator note: I ran {name} {arguments} myself. Result: {output}")
+		},
+		Err(e) => {
+			eprintln!("{name} failed: {}", e.message);
+			format!("Operator note: I ran {name} {arguments} myself and it failed: {}", e.message)
+		},
+	};
+	agent.runtime.append_message(Message::user().with_text(note))?;
+	Ok(())
+}
+
+async fn review(agent: &mut Agent<'_>) -> Result<()> {
+	let snapshot = render_overview(&channel_overview(&agent.runtime.snapshot(), 24));
 	eprintln!("{snapshot}");
 	let text = format!("Current node state:\n\n{snapshot}\n{REVIEW_INSTRUCTION}");
-	runtime.append_message(Message::user().with_text(text))?;
-	run_turn(runtime, provider, model, cancel).await?;
+	agent.runtime.append_message(Message::user().with_text(text))?;
+	agent.turn().await?;
 	Ok(())
 }
 
@@ -239,26 +344,27 @@ fn required_env(name: &str) -> Result<String> {
 }
 
 /// Returns the provider name, the provider, and its default model.
-fn provider_from_env() -> Result<(&'static str, Arc<dyn Provider>, &'static str)> {
+async fn provider_from_env() -> Result<(&'static str, Arc<dyn Provider>, &'static str)> {
 	let name = std::env::var("AGENT_PROVIDER").unwrap_or_default();
 	match name.trim() {
 		"" | "anthropic" => Ok(("anthropic", anthropic_provider()?, "claude-opus-5-5")),
-		"databricks" => Ok(("databricks", databricks_provider()?, "goose")),
+		"databricks" => Ok(("databricks", databricks_provider().await?, "goose")),
 		other => bail!("unknown AGENT_PROVIDER {other}; use anthropic or databricks"),
 	}
 }
 
 /// Databricks model serving, as used by goose at Block. Signs in through the browser like the
 /// goose app does, unless a personal access token is given.
-fn databricks_provider() -> Result<Arc<dyn Provider>> {
+async fn databricks_provider() -> Result<Arc<dyn Provider>> {
 	let host = required_env("DATABRICKS_HOST")?;
 	let token = std::env::var("DATABRICKS_TOKEN").ok().filter(|t| !t.trim().is_empty());
 	let (auth, oauth_token_provider) = match token {
 		Some(token) => (DatabricksAuth::token(token), None),
-		None => (
-			DatabricksAuth::oauth(host.clone()),
-			Some(auth::token_provider(auth::default_token_path()?)),
-		),
+		None => {
+			let login = Arc::new(auth::Login::new(auth::default_token_path()?));
+			login.ensure_signed_in(&host).await?;
+			(DatabricksAuth::oauth(host.clone()), Some(auth::token_provider(login)))
+		},
 	};
 	let retry = DatabricksProvider::load_retry_config(|key| std::env::var(key).ok());
 	let provider = DatabricksProvider::new(
@@ -293,7 +399,7 @@ async fn main() -> Result<()> {
 		println!("{HELP}");
 		return Ok(());
 	};
-	let (provider_name, provider, default_model) = provider_from_env()?;
+	let (provider_name, provider, default_model) = provider_from_env().await?;
 	let model_name = std::env::var("AGENT_MODEL")
 		.ok()
 		.filter(|m| !m.trim().is_empty())
@@ -354,11 +460,19 @@ async fn main() -> Result<()> {
 		}
 	});
 
-	let model = ModelConfig::new(model_name);
+	let policy = Arc::new(Policy::new(PolicyBounds::from_env()?));
+	let mut agent = Agent {
+		runtime: &runtime,
+		policy,
+		provider,
+		model: ModelConfig::new(model_name),
+		lines: stdin_lines(),
+		cancel: cancel.clone(),
+	};
 	let mut topology = None;
 	let result = match options.mode {
-		Mode::Review => review(&runtime, provider, model, cancel.clone()).await,
-		Mode::Chat { initial } => chat(&runtime, provider, model, initial, cancel.clone()).await,
+		Mode::Review => review(&mut agent).await,
+		Mode::Chat { initial } => chat(&mut agent, initial).await,
 		Mode::Demo => {
 			let demo_options = demo_options.expect("set for demo mode");
 			match demo::build(&node, &node_options, &demo_options, cancel.clone()).await {
@@ -374,8 +488,8 @@ async fn main() -> Result<()> {
 						&cancel,
 					)
 					.await;
-					match review(&runtime, provider.clone(), model.clone(), cancel.clone()).await {
-						Ok(()) => chat(&runtime, provider, model, None, cancel.clone()).await,
+					match review(&mut agent).await {
+						Ok(()) => chat(&mut agent, None).await,
 						Err(e) => Err(e),
 					}
 				},
