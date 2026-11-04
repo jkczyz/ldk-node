@@ -136,7 +136,7 @@ use config::{
 use connection::ConnectionManager;
 pub use error::Error as NodeError;
 use error::Error;
-pub use event::Event;
+pub use event::{Event, ForwardFailureReason};
 use event::{EventHandler, EventQueue};
 use fee_estimator::{
 	max_funding_feerate, rbf_splice_feerates, ConfirmationTarget, FeeEstimator, OnchainFeeEstimator,

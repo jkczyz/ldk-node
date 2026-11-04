@@ -19,10 +19,12 @@ use lightning::events::bump_transaction::BumpTransactionEvent;
 #[cfg(not(feature = "uniffi"))]
 use lightning::events::PaidBolt12Invoice;
 use lightning::events::{
-	ClosureReason, Event as LdkEvent, FundingInfo, HTLCLocator as LdkHtlcLocator,
-	PaymentFailureReason, PaymentPurpose, ReplayEvent,
+	ClosureReason, Event as LdkEvent, FundingInfo, HTLCHandlingFailureReason,
+	HTLCHandlingFailureType, HTLCLocator as LdkHtlcLocator, PaymentFailureReason, PaymentPurpose,
+	ReplayEvent,
 };
 use lightning::ln::channelmanager::{PaymentId, TrustedChannelFeatures};
+use lightning::ln::onion_utils::LocalHTLCFailureReason;
 use lightning::ln::types::ChannelId;
 use lightning::routing::gossip::NodeId;
 use lightning::sign::EntropySource;
@@ -306,6 +308,84 @@ pub enum Event {
 		/// The `node_id` of the channel counterparty.
 		counterparty_node_id: PublicKey,
 	},
+	/// An HTLC we were asked to forward could not be forwarded.
+	///
+	/// Routing nodes can use this to detect channels that are depleted or peers that are
+	/// unreliable. Failures of payments destined to us are not reported here.
+	ForwardFailed {
+		/// The `channel_id` of the channel the HTLC arrived on.
+		prev_channel_id: ChannelId,
+		/// The `channel_id` of the channel we attempted to forward over, if the requested next
+		/// hop corresponded to one of our channels.
+		next_channel_id: Option<ChannelId>,
+		/// The `node_id` of the requested next hop, if known.
+		next_node_id: Option<PublicKey>,
+		/// Why the forward failed.
+		reason: ForwardFailureReason,
+	},
+}
+
+/// The reason an HTLC forward failed, as reported by [`Event::ForwardFailed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum ForwardFailureReason {
+	/// The outbound channel did not have enough balance to forward the HTLC.
+	InsufficientOutboundLiquidity,
+	/// The peer on the outbound channel was offline.
+	PeerOffline,
+	/// The outbound channel was not yet ready to forward.
+	ChannelNotReady,
+	/// The HTLC did not pay the fee our channel policy requires.
+	FeeInsufficient,
+	/// The HTLC's amount or expiry violated our channel policy or limits.
+	PolicyViolation,
+	/// The requested next hop did not correspond to any of our channels.
+	UnknownNextHop,
+	/// The HTLC failed further downstream rather than at our node.
+	Downstream,
+	/// Any other failure.
+	Other,
+}
+
+impl_writeable_tlv_based_enum!(ForwardFailureReason,
+	(0, InsufficientOutboundLiquidity) => {},
+	(2, PeerOffline) => {},
+	(4, ChannelNotReady) => {},
+	(6, FeeInsufficient) => {},
+	(8, PolicyViolation) => {},
+	(10, UnknownNextHop) => {},
+	(12, Downstream) => {},
+	(14, Other) => {}
+);
+
+impl From<&HTLCHandlingFailureReason> for ForwardFailureReason {
+	fn from(reason: &HTLCHandlingFailureReason) -> Self {
+		match reason {
+			HTLCHandlingFailureReason::Downstream => Self::Downstream,
+			HTLCHandlingFailureReason::Local { reason } => match reason {
+				// `HTLCMaximum` is returned when the HTLC exceeds what the outgoing channel can
+				// currently carry, which for a drained channel is its spendable balance.
+				LocalHTLCFailureReason::ChannelBalanceOverdrawn
+				| LocalHTLCFailureReason::HTLCMaximum => Self::InsufficientOutboundLiquidity,
+				LocalHTLCFailureReason::PeerOffline => Self::PeerOffline,
+				LocalHTLCFailureReason::ChannelNotReady
+				| LocalHTLCFailureReason::ChannelDisabled => Self::ChannelNotReady,
+				LocalHTLCFailureReason::FeeInsufficient => Self::FeeInsufficient,
+				LocalHTLCFailureReason::AmountBelowMinimum
+				| LocalHTLCFailureReason::HTLCMinimum
+				| LocalHTLCFailureReason::IncorrectCLTVExpiry
+				| LocalHTLCFailureReason::CLTVExpiryTooSoon
+				| LocalHTLCFailureReason::CLTVExpiryTooFar
+				| LocalHTLCFailureReason::OutgoingCLTVTooSoon
+				| LocalHTLCFailureReason::ForwardExpiryBuffer
+				| LocalHTLCFailureReason::DustLimitHolder
+				| LocalHTLCFailureReason::DustLimitCounterparty
+				| LocalHTLCFailureReason::FeeSpikeBuffer => Self::PolicyViolation,
+				LocalHTLCFailureReason::UnknownNextPeer => Self::UnknownNextHop,
+				_ => Self::Other,
+			},
+		}
+	}
 }
 
 impl_writeable_tlv_based_enum!(Event,
@@ -389,6 +469,12 @@ impl_writeable_tlv_based_enum!(Event,
 		(3, counterparty_node_id, required),
 		(5, user_channel_id, required),
 		// TLV 7 (abandoned_funding_txo) may be set for LDK Node v0.7.
+	},
+	(10, ForwardFailed) => {
+		(1, prev_channel_id, required),
+		(3, next_channel_id, option),
+		(5, next_node_id, option),
+		(7, reason, required),
 	},
 );
 
@@ -1499,11 +1585,56 @@ where
 					prober.handle_background_probe_failed(&path, payment_id);
 				}
 			},
-			LdkEvent::HTLCHandlingFailed { failure_type, .. } => {
+			LdkEvent::HTLCHandlingFailed { prev_channel_ids, failure_type, failure_reason } => {
+				let (next_channel_id, next_node_id, unknown_next_hop) = match &failure_type {
+					HTLCHandlingFailureType::Forward { node_id, channel_id } => {
+						(Some(*channel_id), *node_id, false)
+					},
+					HTLCHandlingFailureType::UnknownNextHop { .. } => (None, None, true),
+					// Failures of payments destined to us, invalid onions, and trampoline
+					// forwards are not routing signal.
+					_ => {
+						self.liquidity_source
+							.lsps2_service()
+							.handle_htlc_handling_failed(failure_type)
+							.await;
+						return Ok(());
+					},
+				};
+
 				self.liquidity_source
 					.lsps2_service()
 					.handle_htlc_handling_failed(failure_type)
 					.await;
+
+				let Some(prev_channel_id) = prev_channel_ids.first().copied() else {
+					debug_assert!(false, "HTLCHandlingFailed without a previous channel");
+					return Ok(());
+				};
+
+				let reason = if unknown_next_hop {
+					ForwardFailureReason::UnknownNextHop
+				} else {
+					failure_reason
+						.as_ref()
+						.map(ForwardFailureReason::from)
+						.unwrap_or(ForwardFailureReason::Other)
+				};
+
+				log_info!(
+					self.logger,
+					"Failed to forward HTLC from channel {} to channel {:?}: {:?} ({:?})",
+					prev_channel_id,
+					next_channel_id,
+					reason,
+					failure_reason
+				);
+				let event =
+					Event::ForwardFailed { prev_channel_id, next_channel_id, next_node_id, reason };
+				self.event_queue.add_event(event).await.map_err(|e| {
+					log_error!(self.logger, "Failed to push to event queue: {}", e);
+					ReplayEvent()
+				})?;
 			},
 			LdkEvent::SpendableOutputs { outputs, channel_id, counterparty_node_id } => {
 				match self
