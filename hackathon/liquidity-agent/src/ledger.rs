@@ -12,6 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::{ChannelDetails, Event, ForwardFailureReason, Node};
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -43,6 +44,24 @@ pub struct FailureRecord {
 	pub next_channel_id: Option<String>,
 	pub next_node_id: Option<String>,
 	pub reason: String,
+}
+
+/// The outcome of one payment probe: whether a path could carry an amount at the time.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ProbeRecord {
+	/// Unix timestamp (seconds) when the result was reported.
+	pub at: u64,
+	/// The node id of each hop, in order; the first is our peer, the last the destination.
+	pub hops: Vec<String>,
+	/// The short channel id used to reach each hop, in the same order.
+	pub short_channel_ids: Vec<u64>,
+	pub destination: String,
+	pub amount_msat: u64,
+	/// What the path would have charged in fees.
+	pub fee_msat: u64,
+	pub success: bool,
+	/// For a failed probe, the channel that failed it, if known.
+	pub failed_short_channel_id: Option<u64>,
 }
 
 /// A splice we negotiated whose funding transaction has not locked in yet.
@@ -87,6 +106,7 @@ pub struct ChannelStats {
 struct Inner {
 	forwards: VecDeque<ForwardRecord>,
 	failures: VecDeque<FailureRecord>,
+	probes: VecDeque<ProbeRecord>,
 	/// By channel id.
 	pending_splices: HashMap<String, PendingSplice>,
 }
@@ -100,6 +120,11 @@ pub struct Ledger {
 
 fn now_secs() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// The first eight characters of a node id, for notices.
+fn short_id(node_id: Option<&PublicKey>) -> String {
+	node_id.map(|id| id.to_string()[..8].to_string()).unwrap_or_else(|| "?".into())
 }
 
 fn push_capped<T>(queue: &mut VecDeque<T>, item: T) {
@@ -155,6 +180,24 @@ impl Ledger {
 				push_capped(&mut self.inner.lock().unwrap().failures, record);
 				true
 			},
+			Event::ProbeSucceeded { hops, short_channel_ids, amount_msat, fee_msat, .. } => {
+				self.record_probe(hops, short_channel_ids, *amount_msat, *fee_msat, None, true)
+			},
+			Event::ProbeFailed {
+				hops,
+				short_channel_ids,
+				amount_msat,
+				fee_msat,
+				failed_short_channel_id,
+				..
+			} => self.record_probe(
+				hops,
+				short_channel_ids,
+				*amount_msat,
+				*fee_msat,
+				*failed_short_channel_id,
+				false,
+			),
 			Event::SpliceNegotiated { channel_id, new_funding_txo, .. } => {
 				let channel_id = channel_id.to_string();
 				let pending = PendingSplice {
@@ -171,6 +214,25 @@ impl Ledger {
 			},
 			_ => false,
 		}
+	}
+
+	fn record_probe(
+		&self, hops: &[PublicKey], short_channel_ids: &[u64], amount_msat: u64, fee_msat: u64,
+		failed_short_channel_id: Option<u64>, success: bool,
+	) -> bool {
+		let Some(destination) = hops.last() else { return false };
+		let record = ProbeRecord {
+			at: now_secs(),
+			hops: hops.iter().map(|h| h.to_string()).collect(),
+			short_channel_ids: short_channel_ids.to_vec(),
+			destination: destination.to_string(),
+			amount_msat,
+			fee_msat,
+			success,
+			failed_short_channel_id,
+		};
+		push_capped(&mut self.inner.lock().unwrap().probes, record);
+		true
 	}
 
 	/// Per-channel aggregates over records newer than `since` (unix seconds).
@@ -236,6 +298,24 @@ impl Ledger {
 		let inner = self.inner.lock().unwrap();
 		inner.failures.iter().rev().take(limit).cloned().collect()
 	}
+
+	/// Probe results newer than `since` (unix seconds), newest first, optionally only those
+	/// toward `destination`.
+	pub fn probes_since(&self, since: u64, destination: Option<&str>) -> Vec<ProbeRecord> {
+		let inner = self.inner.lock().unwrap();
+		inner
+			.probes
+			.iter()
+			.rev()
+			.filter(|p| p.at >= since && destination.is_none_or(|d| p.destination == d))
+			.cloned()
+			.collect()
+	}
+
+	pub fn recent_probes(&self, limit: usize) -> Vec<ProbeRecord> {
+		let inner = self.inner.lock().unwrap();
+		inner.probes.iter().rev().take(limit).cloned().collect()
+	}
 }
 
 /// Drains the node's event queue into the ledger until cancelled. Every event is reported
@@ -258,6 +338,19 @@ pub fn spawn_event_drain(
 					)),
 					Event::ForwardFailed { reason, .. } => {
 						notices.note(format!("[node] forward failed: {reason:?}"))
+					},
+					Event::ProbeSucceeded { hops, amount_msat, fee_msat, .. } => {
+						notices.note(format!(
+							"[node] probe of {amount_msat} msat to {} succeeded, fee {fee_msat} msat",
+							short_id(hops.last())
+						))
+					},
+					Event::ProbeFailed { hops, amount_msat, failed_short_channel_id, .. } => {
+						notices.note(format!(
+							"[node] probe of {amount_msat} msat to {} failed at channel {:?}",
+							short_id(hops.last()),
+							failed_short_channel_id
+						))
 					},
 					Event::SpliceNegotiated { channel_id, .. } => notices.note(format!(
 						"[node] splice negotiated on channel {channel_id}; waiting for it to confirm"

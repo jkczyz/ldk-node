@@ -36,7 +36,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::console::Notices;
-use crate::node::{build_and_start, NodeOptions};
+use crate::node::{build_and_start, GossipSource, NodeOptions};
 
 const FUNDING_BTC: &str = "0.05";
 const FUNDING_SATS: u64 = 5_000_000;
@@ -109,6 +109,9 @@ impl DemoOptions {
 			listen,
 			alias: Some(format!("demo-{name}")),
 			sync_interval_secs: Some(SYNC_INTERVAL_SECS),
+			gossip: GossipSource::P2p,
+			peers: vec![],
+			probing_top_nodes: None,
 		})
 	}
 

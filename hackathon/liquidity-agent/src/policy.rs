@@ -25,6 +25,7 @@ use goose_provider_types::conversation::Conversation;
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value;
 
+use crate::deploy_tools::{CloseChannelInput, OpenChannelInput, CLOSE_CHANNEL, OPEN_CHANNEL};
 use crate::runtime::Effect;
 use crate::session::{Decision, Session};
 use crate::tools::{
@@ -167,6 +168,24 @@ impl Policy {
 					))
 				}
 			},
+			OPEN_CHANNEL => {
+				let amount = serde_json::from_value::<OpenChannelInput>(arguments.clone())
+					.map(|input| format!("{} sats", input.amount_sats))
+					.unwrap_or_else(|_| "on-chain funds".to_string());
+				proposal(format!(
+					"Outside policy: opening a channel always needs approval; this one locks \
+					 {amount} into a channel until it is closed."
+				))
+			},
+			CLOSE_CHANNEL => {
+				let channel = serde_json::from_value::<CloseChannelInput>(arguments.clone())
+					.map(|input| input.channel_id)
+					.unwrap_or_else(|_| "a channel".to_string());
+				proposal(format!(
+					"Outside policy: closing a channel always needs approval; this one closes \
+					 {channel} and returns our balance to the on-chain wallet."
+				))
+			},
 			_ => proposal("Outside policy: this action always needs approval.".to_string()),
 		}
 	}
@@ -226,10 +245,10 @@ impl Operation<Session, Effect> for Policy {
 		let text = format!(
 			"Operator policy: forwarding fee changes between {} and {} ppm are applied without \
 			 asking. Splices of up to {} sats, in or out, are applied without asking. Every other \
-			 fund-moving \
-			 action is proposed to the operator and only executed after approval; a declined \
-			 action comes back as a tool error, and you should not retry it unchanged. Read-only \
-			 tools are always available.",
+			 fund-moving action, including every channel open and close, is proposed to the \
+			 operator and only executed after approval; a declined action comes back as a tool \
+			 error, and you should not retry it unchanged. Read-only tools, probes, and peer \
+			 connections are always available.",
 			self.bounds.min_fee_ppm, self.bounds.max_fee_ppm, self.bounds.max_auto_splice_sats
 		);
 		Ok(vec![("policy".to_string(), text)])
@@ -332,6 +351,20 @@ mod tests {
 		let (waiting, declined) = policy.sort_pending(&decisions, &conversation).unwrap();
 		assert!(waiting.is_empty());
 		assert_eq!(declined.iter().map(|p| p.request_id.as_str()).collect::<Vec<_>>(), ["r2"]);
+	}
+
+	#[test]
+	fn channel_opens_and_closes_always_wait() {
+		let bounds = PolicyBounds { max_auto_splice_sats: 1_000_000, ..PolicyBounds::default() };
+		let policy = Policy::new(bounds);
+		let conversation = conversation(vec![
+			request("r1", OPEN_CHANNEL, json!({"node_id": "02abcdef", "amount_sats": 1_000})),
+			request("r2", CLOSE_CHANNEL, json!({"channel_id": "abcdef01"})),
+		]);
+		let (waiting, _) = policy.sort_pending(&HashMap::new(), &conversation).unwrap();
+		assert_eq!(waiting.iter().map(|p| p.request_id.as_str()).collect::<Vec<_>>(), ["r1", "r2"]);
+		assert!(waiting[0].reason.contains("locks 1000 sats"));
+		assert!(waiting[1].reason.contains("closes abcdef01"));
 	}
 
 	#[test]

@@ -15,6 +15,8 @@
 mod auth;
 mod console;
 mod demo;
+mod deploy_tools;
+mod graph;
 mod ledger;
 mod node;
 mod policy;
@@ -59,7 +61,9 @@ const HELP: &str =
 	"Usage: ldk-liquidity-agent [--session-dir DIR | --resume FILE.jsonl] (review | chat [prompt] | demo)
 
   review   Snapshot the node, ask the agent for a liquidity diagnosis and proposals, exit.
-  chat     Interactive questions and instructions; EOF or Ctrl-C exits.
+  chat     Interactive questions and instructions; EOF or Ctrl-C exits. Ask where to deploy
+           capital: the agent reads the gossip graph and our own traffic, probes candidate
+           routes, and proposes channel opens and closes for you to approve.
            '/tool NAME [JSON]' runs a tool yourself, bypassing the model and the policy.
   watch    Chat, plus a review on its own every WATCH_INTERVAL_SECS, when a channel's
            local balance drops below 15% of its capacity, and when a channel fails
@@ -72,6 +76,9 @@ const HELP: &str =
            confirm. Needs a regtest bitcoind.
 
 Node (env):   LDK_NETWORK LDK_STORAGE_DIR LDK_ESPLORA_URL LDK_LISTEN LDK_ALIAS
+              LDK_GOSSIP (p2p, or a Rapid Gossip Sync URL), LDK_PEERS (node_id@host:port,
+              comma-separated, connected at start), LDK_PROBING_TOP_NODES (background
+              probes toward this many of the best-connected nodes; unset = off)
 Agent (env):  AGENT_PROVIDER (anthropic | databricks, default anthropic),
               AGENT_MODEL (default claude-opus-5-5, or goose for databricks),
               AGENT_SESSION_DIR (default ./sessions)
@@ -553,7 +560,7 @@ async fn run_tool_by_hand(agent: &mut Agent<'_>, rest: &str) -> Result<()> {
 		None => (rest, ""),
 	};
 	if name.is_empty() {
-		eprintln!("usage: /tool NAME [JSON]; tools: {}", tools::TOOL_NAMES.join(", "));
+		eprintln!("usage: /tool NAME [JSON]; tools: {}", tools::tool_names().join(", "));
 		return Ok(());
 	}
 	let arguments: serde_json::Value = if arguments.is_empty() {

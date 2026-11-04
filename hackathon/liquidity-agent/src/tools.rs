@@ -20,20 +20,35 @@ use rmcp::model::ErrorData;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::deploy_tools::{
+	self, CloseChannel, ConnectPeer, Demand, FindPeers, GraphSummary, NodeProfile, OpenChannel,
+	Probe, ProbeResults, ReceiveAddress, RouteCost,
+};
 use crate::ledger::{ChannelStats, FailureRecord, ForwardRecord, PendingSplice};
 use crate::session::Session;
 
 /// Tools that change the node. The policy step gates these by name.
-pub const WRITE_TOOLS: &[&str] = &[SET_CHANNEL_FEES, SPLICE_IN, SPLICE_OUT];
-pub const TOOL_NAMES: &[&str] = &[
-	"channel_overview",
-	"recent_forwards",
-	"forward_failures",
-	"node_info",
+pub const WRITE_TOOLS: &[&str] = &[
 	SET_CHANNEL_FEES,
 	SPLICE_IN,
 	SPLICE_OUT,
+	deploy_tools::OPEN_CHANNEL,
+	deploy_tools::CLOSE_CHANNEL,
 ];
+/// Every tool, this module's first and then the deployment tools.
+pub fn tool_names() -> Vec<&'static str> {
+	let mut names = vec![
+		"channel_overview",
+		"recent_forwards",
+		"forward_failures",
+		"node_info",
+		SET_CHANNEL_FEES,
+		SPLICE_IN,
+		SPLICE_OUT,
+	];
+	names.extend_from_slice(deploy_tools::TOOL_NAMES);
+	names
+}
 pub const SET_CHANNEL_FEES: &str = "set_channel_fees";
 pub const SPLICE_IN: &str = "splice_in";
 pub const SPLICE_OUT: &str = "splice_out";
@@ -47,6 +62,17 @@ pub fn tool_operation() -> ToolOperation<Session> {
 		.with_async_tool::<SetChannelFees>()
 		.with_async_tool::<SpliceIn>()
 		.with_async_tool::<SpliceOut>()
+		.with_async_tool::<GraphSummary>()
+		.with_async_tool::<FindPeers>()
+		.with_async_tool::<NodeProfile>()
+		.with_async_tool::<RouteCost>()
+		.with_async_tool::<Demand>()
+		.with_async_tool::<Probe>()
+		.with_async_tool::<ProbeResults>()
+		.with_async_tool::<ReceiveAddress>()
+		.with_async_tool::<ConnectPeer>()
+		.with_async_tool::<OpenChannel>()
+		.with_async_tool::<CloseChannel>()
 }
 
 /// Runs a tool by name outside the machine, for the operator's own `/tool` command. The policy
@@ -70,12 +96,15 @@ pub async fn run_by_name(
 		SET_CHANNEL_FEES => json(SetChannelFees::invoke(session, parse(arguments)?).await?),
 		SPLICE_IN => json(SpliceIn::invoke(session, parse(arguments)?).await?),
 		SPLICE_OUT => json(SpliceOut::invoke(session, parse(arguments)?).await?),
-		other => Err(ErrorData::invalid_params(format!("unknown tool {other}"), None)),
+		other => match deploy_tools::run_by_name(session, other, arguments).await {
+			Some(result) => result,
+			None => Err(ErrorData::invalid_params(format!("unknown tool {other}"), None)),
+		},
 	}
 }
 
 /// Looks a channel up by its full id or a unique prefix of at least six hex characters.
-fn find_channel(session: &Session, channel_id: &str) -> Result<ChannelDetails, ErrorData> {
+pub fn find_channel(session: &Session, channel_id: &str) -> Result<ChannelDetails, ErrorData> {
 	let wanted = channel_id.trim().to_ascii_lowercase();
 	if wanted.len() < 6 {
 		return Err(ErrorData::invalid_params(
