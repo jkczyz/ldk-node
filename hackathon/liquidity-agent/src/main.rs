@@ -22,6 +22,7 @@ mod prompt;
 mod runtime;
 mod session;
 mod tools;
+mod transcript;
 mod watch;
 
 use std::collections::HashMap;
@@ -64,6 +65,8 @@ const HELP: &str =
            local balance drops below 15% of its capacity, and when a channel fails
            three forwards for lack of outbound liquidity within two minutes. A channel
            with a splice pending is left alone until it locks in.
+  transcript FILE
+           Print a session log (sessions/*.jsonl) as a Markdown transcript and exit.
   demo     Start four regtest peers around this node, open channels, drain one with
            traffic, then run watch; mines a block every 20s from then on so splices
            confirm. Needs a regtest bitcoind.
@@ -87,6 +90,7 @@ Demo (env):   DEMO_BITCOIN_CLI (required, e.g. \"bitcoin-cli -regtest -rpcuser=u
 enum Mode {
 	Review,
 	Watch,
+	Transcript { path: PathBuf },
 	Chat { initial: Option<String> },
 	Demo,
 }
@@ -120,6 +124,10 @@ impl Options {
 		let mode = match args.next().as_deref() {
 			Some("review") => Mode::Review,
 			Some("watch") => Mode::Watch,
+			Some("transcript") => {
+				let path = args.next().context("transcript requires a session file")?;
+				Mode::Transcript { path: PathBuf::from(path) }
+			},
 			Some("demo") => Mode::Demo,
 			Some("chat") | None => {
 				let rest: Vec<_> = args.collect();
@@ -461,6 +469,24 @@ async fn watch(agent: &mut Agent<'_>, options: WatchOptions) -> Result<()> {
 						.filter(|c| c.is_usable)
 						.map(|c| (c.channel_id.to_string(), local_pct(c))),
 				);
+				if !settlement.ready.is_empty() {
+					// A splice locking in is the moment the next step becomes possible (the
+					// splice-in after a splice-out, say), so it is reviewed at once.
+					let locked: Vec<String> =
+						settlement.ready.iter().map(|s| s.channel_id.clone()).collect();
+					let trigger = format!(
+						"Triggered by the splice on channel {} locking in: funds that left the \
+						 channel are spendable on-chain now, funds that entered it are usable.{}",
+						locked.join(", "),
+						splice_note(&pending)
+					);
+					eprintln!("\n[watch] {trigger}");
+					review(agent, Some(&trigger)).await?;
+					last_review = Some(Instant::now());
+					last_review_unix = unix_now();
+					show_prompt()?;
+					continue;
+				}
 				if last_review.is_some_and(|at| at.elapsed() < watch::SETTLE_AFTER_REVIEW) {
 					continue;
 				}
@@ -632,6 +658,11 @@ async fn main() -> Result<()> {
 		println!("{HELP}");
 		return Ok(());
 	};
+	if let Mode::Transcript { path } = &options.mode {
+		let records = SessionStore::read_records(path)?;
+		print!("{}", transcript::render(&records));
+		return Ok(());
+	}
 	let (provider_name, provider, default_model) = provider_from_env().await?;
 	let model_name = std::env::var("AGENT_MODEL")
 		.ok()
@@ -715,6 +746,7 @@ async fn main() -> Result<()> {
 	let result = match options.mode {
 		Mode::Review => review(&mut agent, None).await,
 		Mode::Watch => watch(&mut agent, WatchOptions::from_env()?).await,
+		Mode::Transcript { .. } => unreachable!("handled before the node starts"),
 		Mode::Chat { initial } => chat(&mut agent, initial).await,
 		Mode::Demo => {
 			let demo_options = demo_options.expect("set for demo mode");

@@ -167,6 +167,24 @@ impl SessionStore {
 		Ok(store)
 	}
 
+	/// Reads every record of a session log without opening it for writing or needing a node;
+	/// for rendering a transcript.
+	pub fn read_records(path: &Path) -> Result<Vec<Record>> {
+		let file = File::open(path).with_context(|| format!("open session {}", path.display()))?;
+		let mut records = Vec::new();
+		for (i, line) in BufReader::new(file).lines().enumerate() {
+			let line = line?;
+			if line.trim().is_empty() {
+				continue;
+			}
+			records.push(
+				serde_json::from_str(&line)
+					.with_context(|| format!("{}:{}: malformed record", path.display(), i + 1))?,
+			);
+		}
+		Ok(records)
+	}
+
 	pub fn open(path: &Path, node: Arc<Node>, ledger: Arc<Ledger>) -> Result<Self> {
 		if path.extension().is_none_or(|extension| extension != "jsonl") {
 			bail!("session file must have a .jsonl extension");

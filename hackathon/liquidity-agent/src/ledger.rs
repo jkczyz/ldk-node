@@ -91,9 +91,11 @@ struct Inner {
 	pending_splices: HashMap<String, PendingSplice>,
 }
 
-#[derive(Default)]
 pub struct Ledger {
 	inner: Mutex<Inner>,
+	/// Unix timestamp (seconds) when recording started; rates are computed over the time
+	/// actually observed, not the nominal window.
+	started: u64,
 }
 
 fn now_secs() -> u64 {
@@ -109,7 +111,14 @@ fn push_capped<T>(queue: &mut VecDeque<T>, item: T) {
 
 impl Ledger {
 	pub fn new() -> Self {
-		Self::default()
+		Self { inner: Mutex::default(), started: now_secs() }
+	}
+
+	/// How many hours of the last `window_hours` the ledger has actually been recording, at
+	/// least one minute so rates stay finite.
+	pub fn observed_hours(&self, window_hours: u64) -> f64 {
+		let observed = now_secs().saturating_sub(self.started).min(window_hours * 3600).max(60);
+		observed as f64 / 3600.0
 	}
 
 	/// Records the event if it is forwarding- or splice-related. Returns whether it was recorded.

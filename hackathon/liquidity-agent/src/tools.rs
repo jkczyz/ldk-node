@@ -133,6 +133,11 @@ pub struct ChannelRow {
 	pub fee_base_msat: u32,
 	pub fee_ppm: u32,
 	pub cltv_expiry_delta: u16,
+	/// Forwards that left over this channel per hour, over the hours actually observed
+	/// (`observed_hours` in the overview).
+	pub forwards_out_per_hour: f64,
+	/// Fees earned on this channel per hour, same basis.
+	pub fees_earned_msat_per_hour: f64,
 	/// A splice we negotiated on this channel that has not locked in yet. Do not propose
 	/// another splice while one is pending.
 	pub pending_splice: Option<PendingSplice>,
@@ -142,6 +147,9 @@ pub struct ChannelRow {
 #[derive(Serialize, JsonSchema)]
 pub struct ChannelOverviewOutput {
 	pub window_hours: u64,
+	/// How many hours of the window the forwarding statistics actually cover; the per-hour
+	/// rates divide by this.
+	pub observed_hours: f64,
 	pub spendable_onchain_sats: u64,
 	pub total_lightning_sats: u64,
 	pub channels: Vec<ChannelRow>,
@@ -150,6 +158,7 @@ pub struct ChannelOverviewOutput {
 pub fn channel_overview(session: &Session, window_hours: u64) -> ChannelOverviewOutput {
 	let since = now_secs().saturating_sub(window_hours * 3600);
 	let mut stats = session.ledger.stats_since(since);
+	let observed_hours = session.ledger.observed_hours(window_hours);
 	let balances = session.node.list_balances();
 	let details = session.node.list_channels();
 	let mut pending_splices: HashMap<String, PendingSplice> = session
@@ -170,8 +179,11 @@ pub fn channel_overview(session: &Session, window_hours: u64) -> ChannelOverview
 			} else {
 				(local * 100 / c.channel_value_sats).min(100) as u8
 			};
+			let stats = stats.remove(&channel_id).unwrap_or_default();
 			ChannelRow {
-				stats: stats.remove(&channel_id).unwrap_or_default(),
+				forwards_out_per_hour: stats.forwards_out as f64 / observed_hours,
+				fees_earned_msat_per_hour: stats.fees_earned_msat as f64 / observed_hours,
+				stats,
 				pending_splice: pending_splices.remove(&channel_id),
 				channel_id,
 				user_channel_id: c.user_channel_id.0.to_string(),
@@ -192,6 +204,7 @@ pub fn channel_overview(session: &Session, window_hours: u64) -> ChannelOverview
 		.collect();
 	ChannelOverviewOutput {
 		window_hours,
+		observed_hours,
 		spendable_onchain_sats: balances.spendable_onchain_balance_sats,
 		total_lightning_sats: balances.total_lightning_balance_sats,
 		channels,
@@ -203,13 +216,13 @@ pub fn channel_overview(session: &Session, window_hours: u64) -> ChannelOverview
 pub fn render_overview(o: &ChannelOverviewOutput) -> String {
 	let mut out = String::new();
 	out.push_str(&format!(
-		"on-chain spendable: {} sats; lightning total: {} sats; stats window: {}h\n\n",
-		o.spendable_onchain_sats, o.total_lightning_sats, o.window_hours
+		"on-chain spendable: {} sats; lightning total: {} sats; stats window: {}h ({:.2}h observed)\n\n",
+		o.spendable_onchain_sats, o.total_lightning_sats, o.window_hours, o.observed_hours
 	));
-	out.push_str("channel | peer | cap sats | local% | local sats | remote sats | fee base/ppm | fwd in/out | fees msat | fail out (liq) | usable | splice\n");
+	out.push_str("channel | peer | cap sats | local% | local sats | remote sats | fee base/ppm | fwd in/out | fees msat | fwd out/h | fees msat/h | fail out (liq) | usable | splice\n");
 	for c in &o.channels {
 		out.push_str(&format!(
-			"{} | {} | {} | {}% | {} | {} | {}/{} | {}/{} | {} | {} ({}) | {} | {}\n",
+			"{} | {} | {} | {}% | {} | {} | {}/{} | {}/{} | {} | {:.1} | {:.0} | {} ({}) | {} | {}\n",
 			&c.channel_id[..8.min(c.channel_id.len())],
 			&c.counterparty_node_id[..8.min(c.counterparty_node_id.len())],
 			c.capacity_sats,
@@ -221,6 +234,8 @@ pub fn render_overview(o: &ChannelOverviewOutput) -> String {
 			c.stats.forwards_in,
 			c.stats.forwards_out,
 			c.stats.fees_earned_msat,
+			c.forwards_out_per_hour,
+			c.fees_earned_msat_per_hour,
 			c.stats.failures_out,
 			c.stats.liquidity_failures_out,
 			c.is_usable,

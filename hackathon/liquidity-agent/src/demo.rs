@@ -16,6 +16,10 @@
 //!
 //! All channels are announced: LDK Node does not forward into unannounced channels by
 //! default, and announced channels let the sources route through R from gossip alone.
+//!
+//! R's wallet is funded with only what its two channel opens need, so once R -> D1 is drained
+//! the agent cannot simply splice in new funds: the liquidity has to come from the idle
+//! R -> D2 channel (or fees have to steer the traffic).
 
 use std::fs;
 use std::path::PathBuf;
@@ -36,6 +40,9 @@ use crate::node::{build_and_start, NodeOptions};
 
 const FUNDING_BTC: &str = "0.05";
 const FUNDING_SATS: u64 = 5_000_000;
+/// What R gets on top of its two channel amounts: the anchor reserve LDK Node keeps back for
+/// each of its four channels (25,000 sats each) plus funding fees. Little is left to splice in.
+const ROUTER_FUNDING_MARGIN_SATS: u64 = 120_000;
 const PEER_NAMES: [&str; 4] = ["S1", "S2", "D1", "D2"];
 const SYNC_INTERVAL_SECS: u64 = 5;
 /// How often the background miner produces a block once the demo is running.
@@ -249,19 +256,25 @@ pub async fn build(
 	}
 	let topology = Topology { peers, drains };
 
+	let router_funding_sats = options.channel_sats * 2 + ROUTER_FUNDING_MARGIN_SATS;
 	let mut all: Vec<&Arc<Node>> = vec![router];
 	all.extend(topology.peers.iter().map(|p| &p.node));
-	for node in &all {
+	for (i, node) in all.iter().enumerate() {
 		let address =
 			node.onchain_payment().new_address().map_err(|e| anyhow!("new address: {e}"))?;
-		options.cli(&["sendtoaddress", &address.to_string(), FUNDING_BTC])?;
+		let amount = if i == 0 { btc(router_funding_sats) } else { FUNDING_BTC.to_string() };
+		options.cli(&["sendtoaddress", &address.to_string(), &amount])?;
 	}
 	options.mine(1)?;
-	eprintln!("[demo] funded five nodes with {FUNDING_BTC} BTC each, waiting for wallets to sync");
+	eprintln!(
+		"[demo] funded R with {router_funding_sats} sats (just enough for its two channels) and \
+		 the peers with {FUNDING_BTC} BTC each, waiting for wallets to sync"
+	);
 	wait_for(Duration::from_secs(120), "wallets to see their funds", || {
-		all.iter().all(|node| {
+		all.iter().enumerate().all(|(i, node)| {
 			let _ = node.sync_wallets();
-			node.list_balances().spendable_onchain_balance_sats >= FUNDING_SATS
+			let expected = if i == 0 { router_funding_sats } else { FUNDING_SATS };
+			node.list_balances().spendable_onchain_balance_sats >= expected
 		})
 	})
 	.await?;
@@ -282,7 +295,7 @@ pub async fn build(
 	.await?;
 	wait_for(Duration::from_secs(60), "R's wallet to see the R -> D1 funding spend", || {
 		router.sync_wallets().is_ok()
-			&& router.list_balances().total_onchain_balance_sats <= FUNDING_SATS - sats
+			&& router.list_balances().total_onchain_balance_sats <= router_funding_sats - sats
 	})
 	.await?;
 	open_announced(router, &d2.node, sats).context("R -> D2")?;
@@ -302,6 +315,11 @@ pub async fn build(
 	})
 	.await?;
 	Ok(topology)
+}
+
+/// Formats satoshis as the decimal BTC string `bitcoin-cli` expects.
+fn btc(sats: u64) -> String {
+	format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000)
 }
 
 /// Pays `sats` from `source` to `destination` and waits for the outcome. `Ok(true)` on
