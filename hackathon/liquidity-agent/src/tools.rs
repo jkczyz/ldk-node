@@ -24,7 +24,7 @@ use crate::ledger::{ChannelStats, FailureRecord, ForwardRecord, PendingSplice};
 use crate::session::Session;
 
 /// Tools that change the node. The policy step gates these by name.
-pub const WRITE_TOOLS: &[&str] = &[SET_CHANNEL_FEES, SPLICE_IN];
+pub const WRITE_TOOLS: &[&str] = &[SET_CHANNEL_FEES, SPLICE_IN, SPLICE_OUT];
 pub const TOOL_NAMES: &[&str] = &[
 	"channel_overview",
 	"recent_forwards",
@@ -32,9 +32,11 @@ pub const TOOL_NAMES: &[&str] = &[
 	"node_info",
 	SET_CHANNEL_FEES,
 	SPLICE_IN,
+	SPLICE_OUT,
 ];
 pub const SET_CHANNEL_FEES: &str = "set_channel_fees";
 pub const SPLICE_IN: &str = "splice_in";
+pub const SPLICE_OUT: &str = "splice_out";
 
 pub fn tool_operation() -> ToolOperation<Session> {
 	ToolOperation::<Session>::new()
@@ -44,6 +46,7 @@ pub fn tool_operation() -> ToolOperation<Session> {
 		.with_async_tool::<NodeInfo>()
 		.with_async_tool::<SetChannelFees>()
 		.with_async_tool::<SpliceIn>()
+		.with_async_tool::<SpliceOut>()
 }
 
 /// Runs a tool by name outside the machine, for the operator's own `/tool` command. The policy
@@ -66,6 +69,7 @@ pub async fn run_by_name(
 		"node_info" => json(NodeInfo::invoke(session, parse(arguments)?).await?),
 		SET_CHANNEL_FEES => json(SetChannelFees::invoke(session, parse(arguments)?).await?),
 		SPLICE_IN => json(SpliceIn::invoke(session, parse(arguments)?).await?),
+		SPLICE_OUT => json(SpliceOut::invoke(session, parse(arguments)?).await?),
 		other => Err(ErrorData::invalid_params(format!("unknown tool {other}"), None)),
 	}
 }
@@ -518,6 +522,79 @@ impl AsyncTool<Session> for SpliceIn {
 			channel_id: channel.channel_id.to_string(),
 			amount_sats: input.amount_sats,
 			status: "splice negotiated; the added balance is usable once the splice transaction confirms".into(),
+		})
+	}
+}
+
+// ---- splice_out --------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct SpliceOutInput {
+	/// Channel id (or unique prefix) from channel_overview.
+	pub channel_id: String,
+	/// Satoshis to move from our side of the channel to the node's on-chain wallet.
+	pub amount_sats: u64,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SpliceOutOutput {
+	pub channel_id: String,
+	pub amount_sats: u64,
+	/// The on-chain wallet address the funds go to.
+	pub address: String,
+	pub status: String,
+}
+
+pub struct SpliceOut;
+
+impl ToolBase for SpliceOut {
+	type Parameter = SpliceOutInput;
+	type Output = SpliceOutOutput;
+	type Error = ErrorData;
+
+	fn name() -> Cow<'static, str> {
+		SPLICE_OUT.into()
+	}
+
+	fn description() -> Option<Cow<'static, str>> {
+		Some("Move funds from our side of an existing channel to the node's on-chain wallet without closing it, reducing its outbound liquidity. Use it to take capital out of a channel that holds most of its capacity but earns little, so it can be spliced into a channel that needs it once this splice has locked in. Pays a transaction fee. Always waits for the operator's approval.".into())
+	}
+}
+
+impl AsyncTool<Session> for SpliceOut {
+	async fn invoke(
+		session: &Session, input: SpliceOutInput,
+	) -> Result<SpliceOutOutput, ErrorData> {
+		if input.amount_sats == 0 {
+			return Err(ErrorData::invalid_params("amount_sats must be positive", None));
+		}
+		let channel = find_channel(session, &input.channel_id)?;
+		let local_sats = channel.outbound_capacity_msat / 1000;
+		if input.amount_sats > local_sats {
+			return Err(ErrorData::invalid_params(
+				format!("amount_sats exceeds our balance of {local_sats} sats on this channel"),
+				None,
+			));
+		}
+		let address = session
+			.node
+			.onchain_payment()
+			.new_address()
+			.map_err(|e| ErrorData::internal_error(format!("new address: {e}"), None))?;
+		session
+			.node
+			.splice_out(
+				&channel.user_channel_id,
+				channel.counterparty.node_id,
+				&address,
+				input.amount_sats,
+			)
+			.map_err(|e| ErrorData::internal_error(format!("splice failed: {e}"), None))?;
+		Ok(SpliceOutOutput {
+			channel_id: channel.channel_id.to_string(),
+			amount_sats: input.amount_sats,
+			address: address.to_string(),
+			status: "splice negotiated; the funds reach the on-chain wallet once the splice transaction confirms".into(),
 		})
 	}
 }

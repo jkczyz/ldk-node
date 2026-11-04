@@ -42,7 +42,7 @@ use goose_providers::anthropic::{AnthropicProviderBuilder, ANTHROPIC_API_VERSION
 use goose_providers::api_client::{ApiClient, AuthMethod};
 use goose_providers::databricks::DatabricksProvider;
 use goose_providers::databricks_auth::DatabricksAuth;
-use ldk_node::Node;
+use ldk_node::{ChannelDetails, Node};
 use tokio_util::sync::CancellationToken;
 
 use console::Notices;
@@ -60,9 +60,10 @@ const HELP: &str =
   review   Snapshot the node, ask the agent for a liquidity diagnosis and proposals, exit.
   chat     Interactive questions and instructions; EOF or Ctrl-C exits.
            '/tool NAME [JSON]' runs a tool yourself, bypassing the model and the policy.
-  watch    Chat, plus a review on its own every WATCH_INTERVAL_SECS and as soon as one
-           channel fails three forwards for lack of outbound liquidity within two
-           minutes. A channel with a splice pending is left alone until it locks in.
+  watch    Chat, plus a review on its own every WATCH_INTERVAL_SECS, when a channel's
+           local balance drops below 15% of its capacity, and when a channel fails
+           three forwards for lack of outbound liquidity within two minutes. A channel
+           with a splice pending is left alone until it locks in.
   demo     Start four regtest peers around this node, open channels, drain one with
            traffic, then run watch; mines a block every 20s from then on so splices
            confirm. Needs a regtest bitcoind.
@@ -322,11 +323,11 @@ async fn handle_line(agent: &mut Agent<'_>, line: String) -> Result<()> {
 
 /// Settles the pending splices against the node's channels, reporting the ones that locked
 /// in or timed out. Called from the watch loop between turns, so the lines print live.
-fn settle_splices(agent: &Agent<'_>) -> ledger::SpliceSettlement {
-	let settlement = agent.ledger.settle_splices(&agent.node.list_channels());
+fn settle_splices(agent: &Agent<'_>, channels: &[ChannelDetails]) -> ledger::SpliceSettlement {
+	let settlement = agent.ledger.settle_splices(channels);
 	for splice in &settlement.ready {
 		agent.notices.note(format!(
-			"[watch] splice on channel {} has locked in; the added balance is usable",
+			"[watch] splice on channel {} has locked in; its new balance is in effect",
 			splice.channel_id
 		));
 	}
@@ -360,10 +361,42 @@ fn splice_note(pending: &[ledger::PendingSplice]) -> String {
 		.map(|s| format!("{} (negotiated {}s ago)", s.channel_id, now.saturating_sub(s.since)))
 		.collect();
 	format!(
-		" A splice is pending on channel {}; its added balance becomes usable once it locks in, \
-		 so do not propose another splice there.",
+		" A splice is pending on channel {}; do not propose another splice there until it has \
+		 locked in, and funds leaving a channel that way are not spendable before then.",
 		list.join(", ")
 	)
+}
+
+/// Our balance as a percentage of the channel's capacity.
+fn local_pct(channel: &ChannelDetails) -> u64 {
+	if channel.channel_value_sats == 0 {
+		return 0;
+	}
+	(channel.outbound_capacity_msat / 1000 * 100 / channel.channel_value_sats).min(100)
+}
+
+/// A sentence naming the usable channels that hold most of their capacity, with how much they
+/// forwarded and earned in the last day, so the review can weigh moving capital from them.
+fn idle_note(channels: &[ChannelDetails], ledger: &Ledger) -> String {
+	let stats = ledger.stats_since(unix_now().saturating_sub(24 * 3600));
+	let idle: Vec<String> = channels
+		.iter()
+		.filter(|c| c.is_usable && local_pct(c) >= watch::IDLE_BALANCE_PCT)
+		.map(|c| {
+			let id = c.channel_id.to_string();
+			let s = stats.get(&id).cloned().unwrap_or_default();
+			format!(
+				"{id} ({}% local, {} forwards out and {} msat earned in the last 24h)",
+				local_pct(c),
+				s.forwards_out,
+				s.fees_earned_msat
+			)
+		})
+		.collect();
+	if idle.is_empty() {
+		return String::new();
+	}
+	format!(" Channels holding most of their capacity: {}.", idle.join("; "))
 }
 
 fn unix_now() -> u64 {
@@ -375,9 +408,11 @@ fn unix_now() -> u64 {
 /// Runs until EOF or cancellation.
 async fn watch(agent: &mut Agent<'_>, options: WatchOptions) -> Result<()> {
 	eprintln!(
-		"Watching: a review every {}s, or sooner when a channel fails {} forwards for lack of \
-		 outbound liquidity within {}s. Type to chat; Ctrl-C or EOF exits.",
+		"Watching: a review every {}s, or sooner when a channel's local balance drops below {}% \
+		 or a channel fails {} forwards for lack of outbound liquidity within {}s. Type to chat; \
+		 Ctrl-C or EOF exits.",
 		options.interval.as_secs(),
+		watch::LOW_BALANCE_PCT,
 		watch::BURST_THRESHOLD,
 		watch::BURST_WINDOW.as_secs()
 	);
@@ -388,6 +423,7 @@ async fn watch(agent: &mut Agent<'_>, options: WatchOptions) -> Result<()> {
 	let mut last_review_unix = unix_now();
 	// Channels whose splice locked in recently, with when; see `watch::excluded_channels`.
 	let mut recently_locked: HashMap<String, Instant> = HashMap::new();
+	let mut balances = watch::BalanceWatch::default();
 	show_prompt()?;
 	loop {
 		if agent.cancel.is_cancelled() {
@@ -406,7 +442,7 @@ async fn watch(agent: &mut Agent<'_>, options: WatchOptions) -> Result<()> {
 				None => break,
 			},
 			_ = scheduled => {
-				let settlement = settle_splices(agent);
+				let settlement = settle_splices(agent, &agent.node.list_channels());
 				note_locked(&settlement, &mut recently_locked);
 				format!(
 					"Scheduled review, {}s after the previous one.{}",
@@ -415,29 +451,61 @@ async fn watch(agent: &mut Agent<'_>, options: WatchOptions) -> Result<()> {
 				)
 			},
 			_ = tokio::time::sleep(watch::POLL_INTERVAL) => {
-				let settlement = settle_splices(agent);
+				let channels = agent.node.list_channels();
+				let settlement = settle_splices(agent, &channels);
 				note_locked(&settlement, &mut recently_locked);
 				let pending = settlement.pending;
+				balances.observe(
+					channels
+						.iter()
+						.filter(|c| c.is_usable)
+						.map(|c| (c.channel_id.to_string(), local_pct(c))),
+				);
 				if last_review.is_some_and(|at| at.elapsed() < watch::SETTLE_AFTER_REVIEW) {
 					continue;
 				}
-				let since = last_review_unix.max(unix_now().saturating_sub(watch::BURST_WINDOW.as_secs()));
 				let excluded = watch::excluded_channels(
 					pending.iter().map(|s| s.channel_id.clone()),
 					&mut recently_locked,
 					Instant::now(),
 				);
-				let Some((channel_id, failures)) =
-					watch::burst(&agent.ledger.stats_since(since), &excluded)
-				else {
-					continue;
-				};
-				format!(
-					"Triggered by {failures} forwards that failed for insufficient outbound \
-					 liquidity on channel {channel_id} in the last {}s.{}",
-					watch::BURST_WINDOW.as_secs(),
-					splice_note(&pending)
-				)
+				let crossed = balances.take_due(&excluded);
+				if !crossed.is_empty() {
+					let crossed: Vec<String> = crossed
+						.iter()
+						.map(|id| match channels.iter().find(|c| c.channel_id.to_string() == *id) {
+							Some(c) => format!(
+								"{id} (now {}%, {} sats)",
+								local_pct(c),
+								c.outbound_capacity_msat / 1000
+							),
+							None => id.clone(),
+						})
+						.collect();
+					format!(
+						"Triggered by the local balance of channel {} dropping below {}% of \
+						 capacity; forwards over it will start failing soon.{}{}",
+						crossed.join(", "),
+						watch::LOW_BALANCE_PCT,
+						idle_note(&channels, &agent.ledger),
+						splice_note(&pending)
+					)
+				} else {
+					let since = last_review_unix
+						.max(unix_now().saturating_sub(watch::BURST_WINDOW.as_secs()));
+					let Some((channel_id, failures)) =
+						watch::burst(&agent.ledger.stats_since(since), &excluded)
+					else {
+						continue;
+					};
+					format!(
+						"Triggered by {failures} forwards that failed for insufficient outbound \
+						 liquidity on channel {channel_id} in the last {}s.{}{}",
+						watch::BURST_WINDOW.as_secs(),
+						idle_note(&channels, &agent.ledger),
+						splice_note(&pending)
+					)
+				}
 			},
 		};
 		eprintln!("\n[watch] {trigger}");

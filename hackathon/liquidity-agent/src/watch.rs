@@ -48,6 +48,54 @@ impl WatchOptions {
 	}
 }
 
+/// A usable channel whose local balance falls below this share of its capacity is about to
+/// stop forwarding; crossing it triggers a review before forwards start failing.
+pub const LOW_BALANCE_PCT: u64 = 15;
+/// A channel holding at least this share of its capacity is named in the trigger text as a
+/// place capital could come from.
+pub const IDLE_BALANCE_PCT: u64 = 70;
+
+/// Watches each channel's local balance share for a crossing below [`LOW_BALANCE_PCT`]. Only
+/// a crossing counts: a channel that has been low since it was first seen (an inbound-only
+/// channel, say) does not trigger, and neither does one that stays low.
+#[derive(Default)]
+pub struct BalanceWatch {
+	/// Whether each channel was low at the previous observation.
+	was_low: HashMap<String, bool>,
+	/// Channels that crossed below the threshold and have not been reviewed for it yet.
+	due: HashSet<String>,
+}
+
+impl BalanceWatch {
+	/// Feeds the current local-balance percentage of every usable channel.
+	pub fn observe(&mut self, local_pct: impl IntoIterator<Item = (String, u64)>) {
+		let mut now_low = HashMap::new();
+		for (channel_id, pct) in local_pct {
+			let low = pct < LOW_BALANCE_PCT;
+			if low && self.was_low.get(&channel_id) == Some(&false) {
+				self.due.insert(channel_id.clone());
+			} else if !low {
+				self.due.remove(&channel_id);
+			}
+			now_low.insert(channel_id, low);
+		}
+		self.due.retain(|id| now_low.contains_key(id));
+		self.was_low = now_low;
+	}
+
+	/// The channels whose crossing should be reviewed now, dropping them from the queue.
+	/// Channels in `excluded` stay queued until they are no longer excluded.
+	pub fn take_due(&mut self, excluded: &HashSet<String>) -> Vec<String> {
+		let mut due: Vec<String> =
+			self.due.iter().filter(|id| !excluded.contains(*id)).cloned().collect();
+		due.sort();
+		for id in &due {
+			self.due.remove(id);
+		}
+		due
+	}
+}
+
 /// The channels whose failures must not trigger a review right now: those with a splice
 /// pending, and those whose splice locked in less than a burst window ago, since failures
 /// from before the lock-in would otherwise count against the new balance. Entries older than
@@ -99,6 +147,39 @@ mod tests {
 	#[test]
 	fn burst_picks_the_worst_channel() {
 		assert_eq!(burst(&stats(&[("a", 5), ("b", 3)]), &HashSet::new()), Some(("a".into(), 5)));
+	}
+
+	fn observe(watch: &mut BalanceWatch, pcts: &[(&str, u64)]) {
+		watch.observe(pcts.iter().map(|(id, pct)| (id.to_string(), *pct)));
+	}
+
+	#[test]
+	fn balance_crossing_fires_once_and_again_after_recovery() {
+		let none = HashSet::new();
+		let mut watch = BalanceWatch::default();
+		observe(&mut watch, &[("a", 50), ("inbound", 0)]);
+		assert!(watch.take_due(&none).is_empty(), "a channel low from the start is not a crossing");
+		observe(&mut watch, &[("a", 10), ("inbound", 0)]);
+		assert_eq!(watch.take_due(&none), vec!["a".to_string()]);
+		observe(&mut watch, &[("a", 5), ("inbound", 0)]);
+		assert!(watch.take_due(&none).is_empty(), "staying low is not a new crossing");
+		observe(&mut watch, &[("a", 40), ("inbound", 0)]);
+		observe(&mut watch, &[("a", 12), ("inbound", 0)]);
+		assert_eq!(watch.take_due(&none), vec!["a".to_string()]);
+	}
+
+	#[test]
+	fn excluded_crossings_stay_queued() {
+		let mut watch = BalanceWatch::default();
+		observe(&mut watch, &[("a", 50)]);
+		observe(&mut watch, &[("a", 10)]);
+		let excluded = HashSet::from(["a".to_string()]);
+		assert!(watch.take_due(&excluded).is_empty());
+		assert_eq!(watch.take_due(&HashSet::new()), vec!["a".to_string()]);
+		observe(&mut watch, &[("a", 50)]);
+		observe(&mut watch, &[("a", 10)]);
+		observe(&mut watch, &[("a", 50)]);
+		assert!(watch.take_due(&HashSet::new()).is_empty(), "recovering clears the queue");
 	}
 
 	#[test]
