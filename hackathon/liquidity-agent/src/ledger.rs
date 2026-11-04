@@ -17,6 +17,8 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::console::Notices;
+
 /// Oldest entries are dropped past this many records per kind.
 const CAPACITY: usize = 10_000;
 
@@ -162,10 +164,10 @@ impl Ledger {
 	}
 }
 
-/// Drains the node's event queue into the ledger until cancelled. Non-forwarding events are
-/// logged to stderr and acknowledged so the queue never backs up.
+/// Drains the node's event queue into the ledger until cancelled. Every event is reported
+/// through `notices` and acknowledged so the queue never backs up.
 pub fn spawn_event_drain(
-	node: Arc<Node>, ledger: Arc<Ledger>, cancel: CancellationToken,
+	node: Arc<Node>, ledger: Arc<Ledger>, notices: Arc<Notices>, cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
 	tokio::spawn(async move {
 		loop {
@@ -176,20 +178,20 @@ pub fn spawn_event_drain(
 			};
 			if ledger.record(&event) {
 				match &event {
-					Event::PaymentForwarded { total_fee_earned_msat, .. } => eprintln!(
+					Event::PaymentForwarded { total_fee_earned_msat, .. } => notices.note(format!(
 						"[node] forwarded, fee {} msat",
 						total_fee_earned_msat.unwrap_or(0)
-					),
+					)),
 					Event::ForwardFailed { reason, .. } => {
-						eprintln!("[node] forward failed: {reason:?}")
+						notices.note(format!("[node] forward failed: {reason:?}"))
 					},
 					_ => {},
 				}
 			} else {
-				eprintln!("[node] {event:?}");
+				notices.note(format!("[node] {event:?}"));
 			}
 			if let Err(e) = node.event_handled() {
-				eprintln!("[node] failed to mark event handled: {e}");
+				notices.note(format!("[node] failed to mark event handled: {e}"));
 			}
 		}
 	})

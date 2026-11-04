@@ -13,6 +13,7 @@
 //! - `demo`: build a regtest topology around the node, drain a channel, then review and chat.
 
 mod auth;
+mod console;
 mod demo;
 mod ledger;
 mod node;
@@ -41,6 +42,7 @@ use goose_providers::databricks::DatabricksProvider;
 use goose_providers::databricks_auth::DatabricksAuth;
 use tokio_util::sync::CancellationToken;
 
+use console::Notices;
 use ledger::Ledger;
 use policy::{Policy, PolicyBounds, Proposal};
 use prompt::{Prompt, REVIEW_INSTRUCTION};
@@ -55,7 +57,8 @@ const HELP: &str =
   chat     Interactive questions and instructions; EOF or Ctrl-C exits.
            '/tool NAME [JSON]' runs a tool yourself, bypassing the model and the policy.
   demo     Start four regtest peers around this node, open channels, drain one with
-           traffic, then run review followed by chat. Needs a regtest bitcoind.
+           traffic, then run review followed by chat; mines a block every 20s from then
+           on so splices confirm. Needs a regtest bitcoind.
 
 Node (env):   LDK_NETWORK LDK_STORAGE_DIR LDK_ESPLORA_URL LDK_LISTEN LDK_ALIAS
 Agent (env):  AGENT_PROVIDER (anthropic | databricks, default anthropic),
@@ -184,6 +187,7 @@ struct Agent<'a> {
 	provider: Arc<dyn Provider>,
 	model: ModelConfig,
 	lines: tokio::sync::mpsc::Receiver<io::Result<String>>,
+	notices: Arc<Notices>,
 	cancel: CancellationToken,
 }
 
@@ -200,7 +204,15 @@ impl Agent<'_> {
 
 	/// Runs the machine, and whenever it stops for the operator's decision on a proposed
 	/// action, asks on the terminal, records the answer, and runs again. EOF declines.
+	/// Node notices are held for the whole turn and printed once it is over.
 	async fn turn(&mut self) -> Result<session::Session> {
+		self.notices.hold();
+		let result = self.turn_inner().await;
+		self.notices.release();
+		result
+	}
+
+	async fn turn_inner(&mut self) -> Result<session::Session> {
 		loop {
 			let session = run_turn(
 				self.runtime,
@@ -425,7 +437,13 @@ async fn main() -> Result<()> {
 
 	let cancel = CancellationToken::new();
 	let ledger = Arc::new(Ledger::new());
-	let drain = ledger::spawn_event_drain(Arc::clone(&node), Arc::clone(&ledger), cancel.clone());
+	let notices = Arc::new(Notices::new());
+	let drain = ledger::spawn_event_drain(
+		Arc::clone(&node),
+		Arc::clone(&ledger),
+		Arc::clone(&notices),
+		cancel.clone(),
+	);
 
 	let metadata = SessionMetadata {
 		provider: provider_name.into(),
@@ -467,6 +485,7 @@ async fn main() -> Result<()> {
 		provider,
 		model: ModelConfig::new(model_name),
 		lines: stdin_lines(),
+		notices: Arc::clone(&notices),
 		cancel: cancel.clone(),
 	};
 	let mut topology = None;
@@ -479,8 +498,14 @@ async fn main() -> Result<()> {
 				Ok(built) => {
 					let built = Arc::new(built);
 					topology = Some(Arc::clone(&built));
-					let _traffic =
-						demo::spawn_traffic(Arc::clone(&built), demo_options, cancel.clone());
+					let _traffic = demo::spawn_traffic(
+						Arc::clone(&built),
+						Arc::clone(&demo_options),
+						Arc::clone(&notices),
+						cancel.clone(),
+					);
+					let _miner =
+						demo::spawn_miner(demo_options, Arc::clone(&notices), cancel.clone());
 					demo::wait_for_first_failure(
 						&ledger,
 						&built,

@@ -31,6 +31,7 @@ use ldk_node::{Event, Node};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::console::Notices;
 use crate::ledger::Ledger;
 use crate::node::{build_and_start, NodeOptions};
 
@@ -38,6 +39,8 @@ const FUNDING_BTC: &str = "0.05";
 const FUNDING_SATS: u64 = 5_000_000;
 const PEER_NAMES: [&str; 4] = ["S1", "S2", "D1", "D2"];
 const SYNC_INTERVAL_SECS: u64 = 5;
+/// How often the background miner produces a block once the demo is running.
+const BLOCK_INTERVAL_SECS: u64 = 20;
 
 pub struct DemoOptions {
 	pub dir: PathBuf,
@@ -341,7 +344,8 @@ async fn pay(source: &Peer, destination: &Peer, sats: u64) -> Result<bool> {
 /// S1 pays D1 steadily, which drains R -> D1; every fourth payment is a small S2 -> D2 one
 /// so there is a healthy channel to compare against. Runs until cancelled.
 pub fn spawn_traffic(
-	topology: Arc<Topology>, options: Arc<DemoOptions>, cancel: CancellationToken,
+	topology: Arc<Topology>, options: Arc<DemoOptions>, notices: Arc<Notices>,
+	cancel: CancellationToken,
 ) -> JoinHandle<()> {
 	tokio::spawn(async move {
 		let mut tick: u64 = 0;
@@ -371,7 +375,7 @@ pub fn spawn_traffic(
 					}
 				},
 				Err(e) => {
-					eprintln!("[traffic] {e}");
+					notices.note(format!("[traffic] {e}"));
 					Duration::from_secs(3)
 				},
 			};
@@ -380,6 +384,30 @@ pub fn spawn_traffic(
 				biased;
 				_ = cancel.cancelled() => break,
 				_ = tokio::time::sleep(delay) => {},
+			}
+		}
+	})
+}
+
+/// Mines one block every [`BLOCK_INTERVAL_SECS`] until cancelled, so that anything the agent
+/// puts on chain (a splice, a new channel) confirms without the operator running
+/// `bitcoin-cli` by hand. Started only after [`build`], whose funding steps watch the mempool.
+pub fn spawn_miner(
+	options: Arc<DemoOptions>, notices: Arc<Notices>, cancel: CancellationToken,
+) -> JoinHandle<()> {
+	tokio::spawn(async move {
+		eprintln!("[demo] mining a block every {BLOCK_INTERVAL_SECS}s");
+		loop {
+			tokio::select! {
+				biased;
+				_ = cancel.cancelled() => break,
+				_ = tokio::time::sleep(Duration::from_secs(BLOCK_INTERVAL_SECS)) => {},
+			}
+			let mining = Arc::clone(&options);
+			match tokio::task::spawn_blocking(move || mining.mine(1)).await {
+				Ok(Ok(())) => {},
+				Ok(Err(e)) => notices.note(format!("[demo] mining failed: {e:#}")),
+				Err(e) => notices.note(format!("[demo] miner panicked: {e}")),
 			}
 		}
 	})

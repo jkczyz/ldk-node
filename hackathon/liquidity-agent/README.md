@@ -28,6 +28,6 @@ With an Anthropic key instead: `ANTHROPIC_API_KEY=... ./target/debug/ldk-liquidi
 
 - `review`: snapshot the node, ask for a diagnosis and up to three actions, exit.
 - `chat [prompt]`: interactive operator session over the same persisted conversation.
-- `demo`: build a five-node regtest topology around the node, drive traffic that drains one channel, then run `review` and `chat`. Needs `DEMO_BITCOIN_CLI`.
+- `demo`: build a five-node regtest topology around the node, drive traffic that drains one channel, then run `review` and `chat`. Once the topology is up it mines a block every 20 seconds, so a splice the agent proposes confirms on its own. Needs `DEMO_BITCOIN_CLI`.
 
 Run `./target/debug/ldk-liquidity-agent --help` for every environment variable, including the policy bounds that decide which actions apply without asking.
