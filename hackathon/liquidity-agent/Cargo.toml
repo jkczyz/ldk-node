@@ -1,0 +1,29 @@
+[package]
+name = "ldk-liquidity-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94.1"
+description = "A GDK agent that manages channel liquidity for a fee-earning LDK Node"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Standalone: LDK Node itself targets an older toolchain than the GDK requires.
+[workspace]
+
+[dependencies]
+ldk-node = { path = "../.." }
+
+anyhow = "1"
+async-trait = "0.1"
+goose-agent = "=0.1.0-alpha.13"
+goose-provider-types = "=0.1.0-alpha.13"
+goose-providers = { version = "=0.1.0-alpha.13", features = ["rustls-tls"] }
+rmcp = { version = "=3.4.1", default-features = false, features = ["schemars", "server"] }
+# Only for the Databricks OAuth token exchange; same version the GDK already pulls in.
+reqwest = { version = "=0.13.2", default-features = false, features = ["rustls", "json"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
